@@ -1,8 +1,8 @@
 # OTA_HEADUNIT End-to-End Guide
 
-Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 업데이트 → 관제** 전체 실행 가이드입니다.
+Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 업데이트 → 관제** 전체 실행 가이드임
 
-이 문서는 **2026-03-04 기준 현재 저장소 상태**(통합 Docker 스택, 3001 대시보드 기본, RAUC A/B OTA, OTA_GH+OTA_VLM 연동, 로컬 HTTP-first trigger fallback)를 기준으로 작성했습니다.
+통합 Docker 스택, 3001 대시보드 기본, RAUC A/B OTA, OTA_GH+OTA_VLM 연동, 로컬 HTTP-first trigger fallback 기준
 
 ## Table of Contents
 1. [What This Repository Does](#1-what-this-repository-does)
