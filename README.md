@@ -8,6 +8,7 @@ Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 
 1. [What This Repository Does](#1-what-this-repository-does)
 2. [Key Principle: Flash Once, Update by OTA](#2-key-principle-flash-once-update-by-ota)
 3. [Project Layout](#3-project-layout)
+3.1 [Architecture Overview](#31-architecture-overview)
 4. [Prerequisites](#4-prerequisites)
 5. [First-Time Setup (From Scratch)](#5-first-time-setup-from-scratch)
 6. [Daily OTA Workflow (No SD Mount)](#6-daily-ota-workflow-no-sd-mount)
@@ -71,6 +72,76 @@ Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 
 
 - `out/my-hu-image-raspberrypi4-64.rootfs.wic.gz`
 - `out/my-hu-bundle-raspberrypi4-64.raucb`
+
+---
+
+## 3.1 Architecture Overview
+
+### 3.1-1 Build/Deploy Architecture
+
+```mermaid
+flowchart LR
+  DEV[Developer Code Changes]
+  YOCTO[Yocto Build Container]
+  ART[Artifacts<br/>.wic.gz / .raucb]
+  SD[SD Flash<br/>initial only]
+  RPI[Raspberry Pi 4 Device]
+  GH[OTA_GH<br/>API+Dashboard+MQTT]
+  VLM[OTA_VLM<br/>Monitoring/Analytics]
+
+  DEV --> YOCTO --> ART
+  ART --> SD --> RPI
+  ART --> GH
+  GH <--> RPI
+  GH --> VLM
+```
+
+### 3.1-2 Runtime OTA Control/Data Flow
+
+```mermaid
+sequenceDiagram
+  participant U as User (Dashboard)
+  participant S as OTA_GH Server
+  participant D as Device ota-backend
+  participant R as RAUC
+  participant M as OTA_VLM
+
+  U->>S: Trigger Update
+  S->>D: POST /ota/start (HTTP-first)
+  alt HTTP trigger failed
+    S->>D: MQTT ota/{vehicle_id}/cmd
+  end
+  D->>S: MQTT status/progress
+  D->>R: rauc install bundle.raucb
+  R-->>D: slot switch + reboot
+  D->>S: final status (OK/FAIL)
+  S->>M: ingest normalized result log
+```
+
+### 3.1-3 Device A/B Slot Model
+
+```mermaid
+flowchart TB
+  A[rootfs.A (slot A)]
+  B[rootfs.B (slot B)]
+  OTA[RAUC install to inactive slot]
+  BOOT[Bootloader switch target slot]
+  OK[Boot success -> keep slot]
+  FAIL[Boot fail -> rollback policy]
+
+  A -- running --> OTA
+  OTA -- write --> B
+  B --> BOOT --> OK
+  BOOT --> FAIL
+  B -- running --> OTA
+  OTA -- write --> A
+```
+
+운영 해석:
+
+- 초기 배포는 `.wic.gz` SD flash로 시작한다.
+- 운영 업데이트는 `.raucb` OTA만 수행한다(일반적으로 SD 재마운트 불필요).
+- 현재 구성은 디바이스 반응성을 위해 **HTTP-first trigger + MQTT fallback** 전략을 사용한다.
 
 ---
 
