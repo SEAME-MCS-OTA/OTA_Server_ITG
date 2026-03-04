@@ -83,15 +83,18 @@ Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 
 flowchart LR
   DEV[Developer Code Changes]
   YOCTO[Yocto Build Container]
-  ART[Artifacts<br/>.wic.gz / .raucb]
+  YIMG["Yocto Head Unit Image<br/>my-hu-image .wic.gz"]
+  RBUNDLE["RAUC Bundle<br/>my-hu-bundle .raucb"]
   SD[SD Flash<br/>initial only]
   RPI[Raspberry Pi 4 Device]
   GH[OTA_GH<br/>API+Dashboard+MQTT]
   VLM[OTA_VLM<br/>Monitoring/Analytics]
 
-  DEV --> YOCTO --> ART
-  ART --> SD --> RPI
-  ART --> GH
+  DEV --> YOCTO
+  YOCTO --> YIMG
+  YOCTO --> RBUNDLE
+  YIMG --> SD --> RPI
+  RBUNDLE --> GH
   GH <--> RPI
   GH --> VLM
 ```
@@ -141,7 +144,7 @@ flowchart TB
 
 운영 해석:
 
-- 초기 배포는 `.wic.gz` SD flash로 시작한다.
+- 초기 배포는 **Yocto Head Unit Image(`my-hu-image-raspberrypi4-64.rootfs.wic.gz`)** SD flash로 시작한다.
 - 운영 업데이트는 `.raucb` OTA만 수행한다(일반적으로 SD 재마운트 불필요).
 - 현재 구성은 디바이스 반응성을 위해 **HTTP-first trigger + MQTT fallback** 전략을 사용한다.
 
