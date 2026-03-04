@@ -122,19 +122,21 @@ sequenceDiagram
 
 ```mermaid
 flowchart TB
-  A[rootfs.A (slot A)]
-  B[rootfs.B (slot B)]
-  OTA[RAUC install to inactive slot]
-  BOOT[Bootloader switch target slot]
-  OK[Boot success -> keep slot]
-  FAIL[Boot fail -> rollback policy]
+  A["Rootfs A (active slot)"]
+  B["Rootfs B (inactive slot)"]
+  OTA["RAUC install to inactive slot"]
+  OTA2["Next OTA cycle"]
+  BOOT["Bootloader switches next boot slot"]
+  OK["Boot success: keep new slot"]
+  FAIL["Boot fail: rollback policy"]
 
   A -- running --> OTA
   OTA -- write --> B
-  B --> BOOT --> OK
+  B --> BOOT
+  BOOT --> OK
   BOOT --> FAIL
-  B -- running --> OTA
-  OTA -- write --> A
+  B -- running after next OTA --> OTA2
+  OTA2 -- write back --> A
 ```
 
 운영 해석:
