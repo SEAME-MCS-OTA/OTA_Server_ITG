@@ -1,406 +1,585 @@
-# IVI Head Unit on Raspberry Pi 4
+# OTA_HEADUNIT End-to-End Guide
 
-This repository is a practical reference project for an in-vehicle infotainment (IVI) head unit.
-It combines:
+Raspberry Pi 4 기반 IVI Head Unit 프로젝트의 **빌드 → 배포 → OTA 업데이트 → 관제** 전체 실행 가이드입니다.
 
-- Yocto-based Linux image build
-- RAUC A/B OTA update flow
-- Weston (Wayland compositor) for display
-- Qt6/QML full-screen head unit UI
-- FastAPI OTA backend service
-
-The goal is to let you build, flash, boot, and operate a working demo system on Raspberry Pi 4.
+이 문서는 **2026-03-04 기준 현재 저장소 상태**(통합 Docker 스택, 3001 대시보드 기본, RAUC A/B OTA, OTA_GH+OTA_VLM 연동, 로컬 HTTP-first trigger fallback)를 기준으로 작성했습니다.
 
 ## Table of Contents
+1. [What This Repository Does](#1-what-this-repository-does)
+2. [Key Principle: Flash Once, Update by OTA](#2-key-principle-flash-once-update-by-ota)
+3. [Project Layout](#3-project-layout)
+4. [Prerequisites](#4-prerequisites)
+5. [First-Time Setup (From Scratch)](#5-first-time-setup-from-scratch)
+6. [Daily OTA Workflow (No SD Mount)](#6-daily-ota-workflow-no-sd-mount)
+7. [Unified Stack Operations](#7-unified-stack-operations)
+8. [Firmware Management (Upload/Activate/Delete)](#8-firmware-management-uploadactivatedelete)
+9. [Monitoring and Log Pipeline (OTA_VLM)](#9-monitoring-and-log-pipeline-ota_vlm)
+10. [RPi IP Auto Discovery (Server Side)](#10-rpi-ip-auto-discovery-server-side)
+11. [Device Checks and Logs](#11-device-checks-and-logs)
+12. [Troubleshooting](#12-troubleshooting)
+13. [API Cheat Sheet](#13-api-cheat-sheet)
 
-1. [What You Get](#what-you-get)
-2. [How the System Works](#how-the-system-works)
-3. [Repository Layout](#repository-layout)
-4. [Requirements](#requirements)
-5. [Quick Start (Build to SD Boot)](#quick-start-build-to-sd-boot)
-6. [Boot Sequence on Device](#boot-sequence-on-device)
-7. [UI Pages and Features](#ui-pages-and-features)
-8. [OTA Backend API](#ota-backend-api)
-9. [RAUC Slots and Partitioning](#rauc-slots-and-partitioning)
-10. [Log Collection and Where to Look](#log-collection-and-where-to-look)
-11. [Update Strategy: Rebuild vs SD-only Patch](#update-strategy-rebuild-vs-sd-only-patch)
-12. [Troubleshooting](#troubleshooting)
-13. [Default Wi-Fi Profile](#default-wi-fi-profile)
-14. [Known Limits](#known-limits)
+---
 
-## What You Get
+## 1. What This Repository Does
 
-After a successful build and flash, the device should:
+이 저장소는 아래 기능을 통합합니다.
 
-- Boot into Linux on Raspberry Pi 4
-- Start Weston automatically
-- Start `headunit-ui` (Qt app) in full-screen over Wayland
-- Run OTA backend on port `8080`
-- Save UI/Weston diagnostics under `/data/log/ui`
-- Open map and YouTube from Qt WebEngine pages
-- Show current time in OTA page `Content` section
+- Yocto 이미지 빌드 (`.wic.gz`)
+- RAUC OTA 번들 빌드 (`.raucb`)
+- Weston + Qt/QML Head Unit UI 자동 부팅
+- 디바이스 OTA 백엔드 (`ota-backend`, 포트 `8080`)
+- OTA 업데이트 서버/대시보드 (`OTA_GH`)
+- 관제/분석 서버/대시보드 (`OTA_VLM`)
+- OTA 성공/실패 로그 스키마 기반 수집 및 분류
 
-## How the System Works
+중요: 현재 루트 저장소는 **통합 실행/문서 중심 저장소**이며, `OTA_GH/`, `OTA_VLM/`는 각각 독립 개발 이력(.git)을 유지하는 구조입니다.
 
-```text
-                     +--------------------------------------+
-                     |           OTA Backend (FastAPI)      |
-                     |   /ota/start, /ota/status, /health   |
-                     +-------------------+------------------+
-                                         |
-                                         | runs RAUC commands
-                                         v
-+-------------------+      Wayland      +-------------------+
-|   Qt6/QML UI      | <---------------> |      Weston       |
-|   headunit-ui     |                    |   DRM/KMS output  |
-+---------+---------+                    +---------+---------+
-          |                                          |
-          | reads status / starts OTA                | renders to HDMI
-          +------------------------------+-----------+
-                                         |
-                                         v
-                               +-------------------+
-                               |   RAUC A/B slots  |
-                               | rootfsA / rootfsB |
-                               +-------------------+
-```
+---
 
-## Repository Layout
+## 2. Key Principle: Flash Once, Update by OTA
+
+핵심 운영 원칙:
+
+- **초기 1회**: SD에 `.wic.gz`를 굽는다.
+- **그 이후**: 코드 변경은 `.raucb`를 만들어 OTA로 배포한다.
+- 즉, 평소에는 **SD 카드 마운트/수동 복사 없이 OTA**가 기본이다.
+
+예외적으로 SD 직접 수정이 필요한 경우:
+
+- 완전 초기 부팅 불가
+- OTA agent/service 자체가 깨져서 OTA 경로가 끊긴 경우
+- 긴급 복구 작업
+
+---
+
+## 3. Project Layout
 
 ```text
-OTA_HEADUNIT/
-├── Dockerfile
-├── docker-compose.yml
-├── tools/
-│   ├── yocto-init.sh
-│   ├── build-image.sh
-│   ├── build-rauc-bundle.sh
-│   └── rauc-generate-keys.sh
-├── yocto/
-│   ├── conf/
-│   ├── meta-myproduct/
-│   └── sources/
-├── ui/qt-headunit/
-│   ├── src/main.cpp
-│   ├── qml/
-│   │   ├── Main.qml
-│   │   ├── pages/
-│   │   │   ├── HomePage.qml
-│   │   │   ├── NavPage.qml
-│   │   │   ├── MediaPage.qml
-│   │   │   └── OtaPage.qml
-│   │   ├── components/
-│   │   └── services/OtaApi.js
-│   ├── systemd/
-│   │   ├── headunit.service
-│   │   ├── ui-log-collector.service
-│   │   └── ui-log-collector.timer
-│   └── weston/weston.ini
-├── services/ota-backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── models.py
-│   │   └── ota_logic.py
-│   └── systemd/ota-backend.service
-├── docs/
-│   ├── rauc.md
-│   └── partitioning.md
-├── systemd/
-├── _build/    # Yocto build output
-├── _cache/    # downloads/sstate
-└── out/       # exported artifacts
+/home/yg/OTA_HEADUNIT
+├── ui/qt-headunit/                     # Qt/QML UI
+├── services/ota-backend/               # Device-side OTA backend (8080)
+├── OTA_GH/                             # OTA server + dashboard + MQTT
+├── OTA_VLM/                            # Monitoring server + dashboard
+├── tools/                              # Build/stack scripts
+├── out/                                # Final artifacts (.wic.gz, .raucb)
+├── docker-compose.ota-stack.yml        # Unified OTA_GH + OTA_VLM stack
+└── README.md
 ```
 
-## Requirements
+주요 산출물:
 
-Host machine:
+- `out/my-hu-image-raspberrypi4-64.rootfs.wic.gz`
+- `out/my-hu-bundle-raspberrypi4-64.raucb`
 
-- Linux (Ubuntu recommended)
-- Docker 20.10+
-- Docker Compose v2 (`docker compose`)
-- 16 GB RAM or more
-- 100 GB free disk or more
+---
 
-Hardware:
+## 4. Prerequisites
+
+Host(권장):
+
+- Ubuntu 22.04+
+- Docker + Docker Compose v2
+- RAM 16GB+
+- Disk 100GB+
+
+Device:
 
 - Raspberry Pi 4
-- SD card (size depends on image and data usage)
+- SD card
 - HDMI display
+- Wi-Fi network
 
-## Quick Start (Build to SD Boot)
+선택 도구:
 
-### 1) Build the container image
+- `jq` (JSON 보기 편함)
 
 ```bash
-docker compose build
+sudo apt-get update
+sudo apt-get install -y jq
 ```
 
-### 2) Initialize Yocto sources and layers
+---
+
+## 5. First-Time Setup (From Scratch)
+
+### Step 1) Build Yocto image + RAUC bundle
 
 ```bash
-docker compose run --rm yocto bash -lc './tools/yocto-init.sh'
+cd /home/yg/OTA_HEADUNIT
+
+docker compose run --rm yocto bash -lc '
+set -e
+./tools/yocto-init.sh
+./tools/build-image.sh
+./tools/build-rauc-bundle.sh
+'
 ```
 
-### 3) Build target image
+결과 확인:
 
 ```bash
-docker compose run --rm yocto bash -lc './tools/build-image.sh'
+ls -lh out/my-hu-image-raspberrypi4-64.rootfs.wic.gz
+ls -lh out/my-hu-bundle-raspberrypi4-64.raucb
 ```
 
-### 4) Optional: build RAUC bundle
+### Step 2) Flash SD (initial only)
+
+`/dev/sdX`를 실제 SD 디바이스로 바꿔서 실행:
 
 ```bash
-docker compose run --rm yocto bash -lc './tools/build-rauc-bundle.sh'
-```
-
-### 5) Flash SD card
-
-```bash
-lsblk
-zcat out/my-hu-image-raspberrypi4-64.rootfs.wic.gz | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
+zcat /home/yg/OTA_HEADUNIT/out/my-hu-image-raspberrypi4-64.rootfs.wic.gz \
+  | sudo dd of=/dev/sdX bs=4M status=progress conv=fsync
 sync
 ```
 
-Replace `/dev/sdX` with your actual SD card device path.
+### Step 3) Boot device and verify core services
 
-Tip:
-
-- `tools/build-image.sh` refreshes `out/my-hu-image-raspberrypi4-64.rootfs.wic.gz`
-  to point at the latest timestamped image.
-- If you want an exact artifact, flash `out/my-hu-image-raspberrypi4-64.rootfs-<timestamp>.wic.gz` directly.
-
-### 6) Boot the device and verify services
-
-On the device console:
+Raspberry Pi에서:
 
 ```bash
-systemctl status seatd weston headunit ota-backend --no-pager
+systemctl --no-pager -l status weston headunit ota-backend
+curl -sS http://127.0.0.1:8080/health
+curl -sS http://127.0.0.1:8080/ota/status
 ```
 
-Expected:
+정상 기준:
 
-- `weston` is active
-- `headunit` is active
-- `ota-backend` is active
+- `weston/headunit/ota-backend`: `active`
+- `/health`: `ok: true`
 
-## Boot Sequence on Device
-
-The intended boot flow is:
-
-1. `seatd.service` starts (seat management for compositor access).
-2. `weston.service` starts (Wayland compositor).
-3. `headunit.service` waits for `/run/weston/wayland-*`.
-4. `headunit-ui` starts with `QT_QPA_PLATFORM=wayland`.
-5. `ui-log-collector.timer` periodically stores diagnostic logs in `/data/log/ui`.
-
-Important implementation detail:
-
-- `ui/qt-headunit/systemd/headunit.service` uses `ExecStartPre` to wait for Wayland socket.
-- This avoids race conditions where Qt starts before Weston socket exists.
-
-## UI Pages and Features
-
-Main entry:
-
-- `ui/qt-headunit/qml/Main.qml`
-
-Pages:
-
-- `HomePage.qml`: launcher and top-level status view.
-- `NavPage.qml`: map view using `WebEngineView` + local iframe wrapper (`NavMapView.html`).
-- `MediaPage.qml`: media page with real YouTube web view (`MediaYoutubeWebView.qml`).
-- `OtaPage.qml`: OTA page with status, flow display, auto polling, and `Content` time display.
-
-Service module:
-
-- `ui/qt-headunit/qml/services/OtaApi.js`
-- Centralizes OTA HTTP calls used by QML pages.
-
-Note about QML updates:
-
-- QML is bundled into the `headunit-ui` binary via `qml.qrc`.
-- Editing files on mounted SD rootfs does not always update runtime behavior unless you rebuild and redeploy `headunit-ui`.
-- `NavMapView.html` is also bundled via `qml.qrc`, so map behavior changes require UI rebuild too.
-
-## OTA Backend API
-
-Service implementation:
-
-- `services/ota-backend/app/main.py`
-
-Default endpoint:
-
-- `http://<device-ip>:8080`
-
-APIs:
-
-- `GET /health`: service health check
-- `GET /ota/status`: current OTA + slot status
-- `POST /ota/start`: start OTA with bundle URL
-- `POST /ota/reboot`: trigger system reboot
-
-Example OTA start call:
+### Step 4) Start unified server stack on host
 
 ```bash
-curl -X POST http://<device-ip>:8080/ota/start \
-  -H 'Content-Type: application/json' \
-  -d '{"ota_id":"ota-20260130-319f58","url":"https://server/bundle.raucb","target_version":"1.2.4"}'
+cd /home/yg/OTA_HEADUNIT
+./tools/ota-stack-up.sh
 ```
 
-## RAUC Slots and Partitioning
+이 스크립트는 자동으로:
 
-Reference docs:
+- OTA_GH + OTA_VLM 모두 기동
+- 대시보드 포트 기본 `3001`
+- `OTA_GH_FIRMWARE_BASE_URL`을 호스트 IP 기준으로 자동 설정/저장
+  - 저장 위치: `/home/yg/OTA_HEADUNIT/.env`
+  - 예: `http://192.168.86.30:8080`
+- 로컬 장치 직접 트리거 매핑 기본값 적용
+  - `OTA_GH_LOCAL_DEVICE_MAP=vw-ivi-0026@192.168.86.250:8080`
 
-- `docs/rauc.md`
-- `docs/partitioning.md`
-- `yocto/meta-myproduct/recipes-core/images/my-hu-image.wks`
+접속:
 
-Current layout concept:
+- OTA dashboard (operations+monitoring): `http://localhost:3001`
+- OTA API: `http://localhost:8080`
+- Monitoring frontend: `http://localhost:5173`
+- Monitoring backend: `http://localhost:4000`
 
-- `p1`: `/boot` (shared)
-- `p2`: `rootfsA`
-- `p3`: `rootfsB`
-- `p4`: `/data`
+---
 
-RAUC behavior:
+## 6. Daily OTA Workflow (No SD Mount)
 
-- Installs update to inactive rootfs slot.
-- Shared `/boot` strategy is used for this project/demo flow.
-- Production system should use explicit bootloader slot control and rollback policy.
+이 단계가 평소 반복 루틴입니다.
 
-## Log Collection and Where to Look
-
-Primary runtime logs on target:
-
-- `/data/log/ui/weston.log`
-- `/data/log/ui/weston-err.log`
-- `/data/log/ui/weston-journal.log`
-- `/data/log/ui/headunit-journal.log`
-- `/data/log/ui/boot-*.log`
-
-Relevant service definitions:
-
-- `yocto/meta-myproduct/recipes-core/systemd/files/weston.service`
-- `ui/qt-headunit/systemd/headunit.service`
-- `ui/qt-headunit/systemd/ui-log-collector.service`
-- `ui/qt-headunit/systemd/ui-log-collector.timer`
-
-Useful commands on target:
+### 6-1) Code change 후 bundle 재빌드
 
 ```bash
-journalctl -u weston.service -b --no-pager
-journalctl -u headunit.service -b --no-pager
-cat /data/log/ui/weston-err.log
+cd /home/yg/OTA_HEADUNIT
+
+docker compose run --rm yocto bash -lc '
+set -e
+./tools/yocto-init.sh
+./tools/build-image.sh
+./tools/build-rauc-bundle.sh
+'
 ```
 
-## Update Strategy: Rebuild vs SD-only Patch
+> 운영상 OTA만 필요해도, 현재 프로젝트 기본 흐름은 `build-image + build-rauc-bundle` 순서를 권장합니다.
 
-Use rebuild when:
-
-- You changed QML/C++ UI code
-- You changed Yocto recipes or package composition
-- You need a reproducible image artifact
-
-You can patch SD card directly (for quick validation only) when:
-
-- You only changed runtime config files (for example `weston.ini`, service unit files, simple scripts)
-- You understand these changes are not yet baked into Yocto image
-
-Recommended workflow:
-
-1. Quick test by patching mounted SD rootfs.
-2. If behavior is correct, apply equivalent change to repository files.
-3. Rebuild image so the fix is permanent and reproducible.
-
-## Troubleshooting
-
-### Weston shows, but Qt UI is missing
-
-Check:
+### 6-2) Firmware 업로드 (active 등록)
 
 ```bash
-journalctl -u headunit.service -b --no-pager
-ls -la /run/weston
+curl -X POST http://localhost:8080/api/v1/admin/firmware \
+  -F "file=@/home/yg/OTA_HEADUNIT/out/my-hu-bundle-raspberrypi4-64.raucb" \
+  -F "version=1.3.9" \
+  -F "release_notes=your release note" \
+  -F "overwrite=true"
 ```
 
-Verify:
+### 6-3) Dashboard에서 차량 선택 후 Update
 
-- Wayland socket exists
-- `headunit.service` has correct `XDG_RUNTIME_DIR` and `QT_QPA_PLATFORM`
+- `http://localhost:3001`
+- Firmware 목록에서 원하는 버전 선택
+- Vehicle 행의 `Update` 버튼 실행
 
-### Only part of the screen is used by Qt
+또는 API로 직접:
 
-Check output mode in:
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":"vw-ivi-0026"}'
+```
 
-- `ui/qt-headunit/weston/weston.ini`
-- `/data/log/ui/weston.log`
+현재 trigger 동작 우선순위:
 
-If needed, set each HDMI output mode explicitly and redeploy.
+1. 로컬 HTTP trigger (`POST http://192.168.86.250:8080/ota/start`)
+2. 실패 시 MQTT topic fallback (`ota/vw-ivi-0026/cmd`)
 
-### Map or YouTube region shows only a center rectangle
+즉, MQTT가 잠시 불안정해도 디바이스 반응 가능성을 높인 상태입니다.
 
-Most common causes:
+특정 버전 강제:
 
-- Network unavailable
-- Incorrect system time (TLS/HTTPS validation fails)
-- GPU/video backend limitations for embedded web/video path
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":"vw-ivi-0026", "version":"1.3.8", "force":true}'
+```
 
-Validate:
+### 6-4) 진행 상태 확인
+
+```bash
+curl -sS http://localhost:8080/api/v1/vehicles | jq .
+docker logs ota_headunit-ota_gh_server-1 --tail 200
+```
+
+디바이스에서:
+
+```bash
+tail -n 200 /data/log/ui/ota-backend-requests.log
+rauc status --output-format=json
+```
+
+---
+
+## 7. Unified Stack Operations
+
+### Start
+
+```bash
+cd /home/yg/OTA_HEADUNIT
+./tools/ota-stack-up.sh
+```
+
+### Stop
+
+```bash
+cd /home/yg/OTA_HEADUNIT
+./tools/ota-stack-down.sh
+```
+
+### Status
+
+```bash
+docker compose -f /home/yg/OTA_HEADUNIT/docker-compose.ota-stack.yml ps
+```
+
+### Follow logs
+
+```bash
+docker compose -f /home/yg/OTA_HEADUNIT/docker-compose.ota-stack.yml logs -f ota_gh_server ota_vlm_backend ota_gh_mosquitto
+```
+
+---
+
+## 8. Firmware Management (Upload/Activate/Delete)
+
+### Where firmware files are stored
+
+업로드된 실제 파일 경로(호스트):
+
+- `/home/yg/OTA_HEADUNIT/OTA_GH/firmware_files`
+
+서버 컨테이너 내부:
+
+- `/app/firmware_files`
+
+### List firmware
+
+```bash
+curl -sS http://localhost:8080/api/v1/firmware | jq .
+curl -sS http://localhost:8080/api/v1/firmware?active_only=true | jq .
+```
+
+### Activate a specific firmware
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/firmware/activate \
+  -H "Content-Type: application/json" \
+  -d '{"version":"1.3.9"}'
+```
+
+### Delete firmware by id
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/admin/firmware/18
+```
+
+---
+
+## 9. Monitoring and Log Pipeline (OTA_VLM)
+
+현재 구성:
+
+- OTA_GH server가 OTA 결과를 OTA_VLM backend `/ingest`로 전달
+- OTA_VLM이 DB + case 파일(`SUCCESS`/`FAIL` 분류)에 저장
+
+주요 경로(호스트):
+
+- `/home/yg/OTA_HEADUNIT/OTA_VLM/failed case/SUCCESS`
+- `/home/yg/OTA_HEADUNIT/OTA_VLM/failed case/<FAIL_CASE_NAME>`
+
+요약 확인:
+
+```bash
+curl -sS http://localhost:4000/health
+curl -sS http://localhost:4000/stats/summary | jq .
+```
+
+대시보드:
+
+- 통합 대시보드 Monitoring 탭: `http://localhost:3001`
+- OTA_VLM 프론트 단독: `http://localhost:5173`
+
+---
+
+## 10. RPi IP Auto Discovery (Server Side)
+
+라즈베리 IP가 자주 바뀌는 환경을 위해 자동 탐지 스크립트를 추가했습니다.
+
+기본값(현재 환경):
+
+- `RPI_DEFAULT_IP=192.168.86.250`
+
+사용:
+
+```bash
+cd /home/yg/OTA_HEADUNIT
+./tools/find-rpi-ip.sh
+./tools/find-rpi-ip.sh --with-source
+```
+
+필요 시 기본값 변경:
+
+```bash
+RPI_DEFAULT_IP=192.168.86.250 ./tools/find-rpi-ip.sh
+RPI_SUBNET_PREFIX=192.168.86 ./tools/find-rpi-ip.sh
+```
+
+탐지 우선순위:
+
+1. `RPI_DEFAULT_IP`(기본: `192.168.86.250`)
+2. `raspberrypi4-64.local`
+3. OTA 서버 로그(최근 `/firmware`/`/ingest` 요청 IP)
+4. `ip neigh` 서브넷 스캔
+
+---
+
+## 11. Device Checks and Logs
+
+디바이스 상태 API:
+
+```bash
+curl -sS http://127.0.0.1:8080/health
+curl -sS http://127.0.0.1:8080/ota/status | jq .
+```
+
+RAUC/slot 확인:
+
+```bash
+rauc status --output-format=json
+cat /proc/cmdline
+```
+
+시간/타임존 확인:
 
 ```bash
 date
-ping -c 3 8.8.8.8
-cat /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+readlink -f /etc/localtime
 ```
 
-For map page in current implementation:
+주요 로그:
 
-- `NavPage.qml` loads `qrc:/pages/NavMapView.html`
-- `NavMapView.html` embeds Google Maps in an `<iframe>`
-- If map fails, check internet first, then check WebEngine errors in `headunit` journal
+- `/data/log/ui/weston.log`
+- `/data/log/ui/weston-err.log`
+- `/data/log/ui/headunit-journal.log`
+- `/data/log/ui/ota-backend-service.log`
+- `/data/log/ui/ota-backend-requests.log`
 
-### OTA time appears with timezone offset
+---
 
-Current OTA page behavior:
+## 12. Troubleshooting
 
-- `Current Time` prefers `context.time.local`, then `ts`
-- ISO timestamp strings are rendered as wall-clock text (`YYYY-MM-DD HH:MM:SS`)
-  to avoid device timezone conversion drift (for example 1-hour offset)
+### 12-1) "업데이트 눌렀는데 반응 없음"
 
-If time is still wrong:
+가장 흔한 원인:
 
-- Verify backend payload (`context.time.local`, `ts`)
-- Verify target timezone files:
-  - `/etc/localtime`
-  - `/etc/timezone`
-- Verify service runtime env in `headunit.service`
+- OTA 서버가 펌웨어 URL을 `localhost`로 계산함
+- 라즈베리 입장에서는 자기 자신(`localhost`)을 보게 되어 다운로드 실패
 
-### Service enable/restart commands fail on host machine
+확인:
 
-If you run commands like `systemctl restart weston` on your Ubuntu host, they will fail because those services exist on the target image, not on host OS.
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/admin/trigger-update \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":"vw-ivi-0026"}'
+```
 
-Run service commands:
+응답에 아래가 보이면 해당 문제:
 
-- On the Raspberry Pi target console, or
-- In mounted rootfs by editing files before boot (not by host `systemctl`)
+- `error: Firmware URL resolves to localhost`
 
-## Default Wi-Fi Profile
+해결:
 
-Default Wi-Fi profile is baked into Yocto through:
+- 반드시 `./tools/ota-stack-up.sh`로 스택을 기동
+- 또는 `OTA_GH_FIRMWARE_BASE_URL=http://<HOST_IP>:8080` 설정 후 서버 재시작
 
-- `yocto/meta-myproduct/recipes-connectivity/wpa-supplicant/files/wpa_supplicant.conf`
+### 12-6) Dashboard에서는 전송 성공인데 라즈베리에서 반응 없음
 
-Current default network:
+증상:
 
-- SSID: `SEA:ME WiFi Access`
-- Password: `1fy0u534m3`
+- 대시보드: update sent/success
+- 라즈베리: 다운로드/적용 로그 없음
 
-Installed on target as:
+원인(가장 빈번):
 
-- `/etc/wpa_supplicant/wpa_supplicant.conf`
-- `/etc/wpa_supplicant/wpa_supplicant-wlan0.conf`
+- 라즈베리 `ota-backend`의 `mqtt_broker_host`가 현재 서버 IP와 다름
+  - 예: 실제 서버는 `192.168.86.30`인데 디바이스는 `192.168.86.29`를 바라봄
 
-## Known Limits
+즉시 확인:
 
-- Raspberry Pi firmware does not provide built-in RAUC A/B boot decision logic.
+```bash
+ssh root@192.168.86.250 "curl -sS http://127.0.0.1:8080/health"
+```
 
+`"mqtt_connected": false`면 broker 경로 불일치 가능성이 큼.
+
+즉시 수정:
+
+```bash
+ssh root@192.168.86.250 "python3 - <<'PY'
+import json
+from urllib.parse import urlparse, urlunparse
+path='/data/etc/ota-backend/config.json'
+with open(path,'r',encoding='utf-8') as f:
+    cfg=json.load(f)
+server_ip='192.168.86.30'  # 현재 OTA 서버 호스트 IP로 변경
+cfg['mqtt_broker_host']=server_ip
+cfg['mqtt_broker_port']=1883
+raw=str(cfg.get('collector_url','')).strip()
+if raw:
+    p=urlparse(raw); scheme=p.scheme or 'http'; port=p.port or 8080
+    cfg['collector_url']=urlunparse((scheme,f'{server_ip}:{port}','/ingest','','',''))
+else:
+    cfg['collector_url']=f'http://{server_ip}:8080/ingest'
+with open(path,'w',encoding='utf-8') as f:
+    json.dump(cfg,f,ensure_ascii=False,indent=2)
+print('updated')
+PY
+systemctl restart ota-backend
+curl -sS http://127.0.0.1:8080/health"
+```
+
+정상 기준:
+
+- `"mqtt_connected": true`
+- `/data/log/ui/ota-backend-requests.log`에 `mqtt connected sub=ota/vw-ivi-0026/cmd` 확인
+
+### 12-2) 차량이 offline으로 보임
+
+- `vehicle_id` 불일치 가능성 확인
+  - 디바이스 `/etc/ota-backend/config.json`의 `device_id`
+  - 대시보드 vehicle_id
+- 재부팅 직후 heartbeat가 다시 들어오기까지 1~3분 걸릴 수 있음
+
+### 12-3) OTA Status에 target version이 안 보임
+
+- 최신 코드 기준 UI/백엔드는 `current -> target` 표시 로직 반영됨
+- 구버전 이미지면 해당 로직 미반영일 수 있으므로 최신 `.raucb`로 업데이트 필요
+
+### 12-4) Vite ENOSPC (watcher limit)
+
+```bash
+sudo sysctl fs.inotify.max_user_watches=524288
+sudo sysctl fs.inotify.max_user_instances=1024
+```
+
+### 12-5) SSH host key changed
+
+```bash
+RPI_IP=$(./tools/find-rpi-ip.sh)
+ssh-keygen -f /home/yg/.ssh/known_hosts -R "${RPI_IP}"
+ssh root@"${RPI_IP}"
+```
+
+---
+
+## 13. API Cheat Sheet
+
+### Server health
+
+```bash
+curl -sS http://localhost:8080/health
+```
+
+### Vehicles
+
+```bash
+curl -sS http://localhost:8080/api/v1/vehicles
+curl -sS http://localhost:8080/api/v1/vehicles/vw-ivi-0026
+```
+
+### Firmware
+
+```bash
+curl -sS http://localhost:8080/api/v1/firmware
+curl -sS http://localhost:8080/api/v1/firmware?active_only=true
+```
+
+### Upload firmware
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/firmware \
+  -F "file=@/home/yg/OTA_HEADUNIT/out/my-hu-bundle-raspberrypi4-64.raucb" \
+  -F "version=1.3.9" \
+  -F "release_notes=release" \
+  -F "overwrite=true"
+```
+
+### Activate firmware
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/firmware/activate \
+  -H "Content-Type: application/json" \
+  -d '{"version":"1.3.9"}'
+```
+
+### Delete firmware
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/admin/firmware/18
+```
+
+### Trigger update
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":"vw-ivi-0026"}'
+```
+
+### Trigger specific version / force mode
+
+```bash
+curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
+  -H "Content-Type: application/json" \
+  -d '{"vehicle_id":"vw-ivi-0026", "version":"1.3.8", "force":true}'
+```
+
+---
+
+## Final Checklist
+
+1. `out/`에 최신 `.wic.gz`, `.raucb`가 생성됨
+2. 장치에서 `weston/headunit/ota-backend`가 active
+3. 통합 스택이 정상(`8080`, `3001`, `4000`, `5173`)
+4. Active firmware 1개 확인
+5. Update trigger 후 `GET /firmware/*.raucb 200` 로그 확인
+6. 장치 재부팅 후 heartbeat 재수신 확인
+7. OTA_VLM 통계/로그 반영 확인
