@@ -787,66 +787,71 @@ const OTADashboard = () => {
                   </div>
                 </div>
 
-                {mapCities.length === 0 ? (
-                  <p className="text-sm text-gray-500">No city coordinate data available.</p>
-                ) : (
-                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                    <div className="lg:col-span-2">
-                      <div className="h-72 rounded-lg border border-slate-300 overflow-hidden">
-                        <MapContainer
-                          center={[51.1657, 10.4515]}
-                          zoom={6}
-                          scrollWheelZoom={true}
-                          className="h-full w-full"
-                        >
-                          <TileLayer
-                            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                          />
-                          {mapCities.map((city) => {
-                            const lat = Number(city.coords?.lat);
-                            const lon = Number(city.coords?.lon);
-                            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-                            const rate = Number(city.failure_rate || 0);
-                            const radius = 7 + Math.round(Math.min(10, rate * 20));
-                            const active = monitoringCity === city.city;
-                            return (
-                              <CircleMarker
-                                key={`marker-${city.city}`}
-                                center={[lat, lon]}
-                                radius={radius}
-                                pathOptions={{
-                                  color: active ? '#ffffff' : '#fde68a',
-                                  weight: active ? 3 : 2,
-                                  fillColor: active ? '#ef4444' : '#f59e0b',
-                                  fillOpacity: 0.85,
-                                }}
-                                eventHandlers={{
-                                  click: () =>
-                                    setMonitoringCity((prev) => (prev === city.city ? '' : city.city)),
-                                }}
-                              >
-                                <LeafletTooltip direction="top" offset={[0, -8]} opacity={0.95}>
-                                  <div className="text-xs">
-                                    <div className="font-semibold">{city.city}</div>
-                                    <div>
-                                      {city.failures}/{city.total} ({(rate * 100).toFixed(1)}%)
-                                    </div>
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                  <div className="lg:col-span-2">
+                    <div className="h-72 rounded-lg border border-slate-300 overflow-hidden">
+                      <MapContainer
+                        center={[51.1657, 10.4515]}
+                        zoom={6}
+                        scrollWheelZoom={true}
+                        className="h-full w-full"
+                      >
+                        <TileLayer
+                          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                        />
+                        {mapCities.map((city) => {
+                          const lat = Number(city.coords?.lat);
+                          const lon = Number(city.coords?.lon);
+                          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+                          const rate = Number(city.failure_rate || 0);
+                          const radius = 7 + Math.round(Math.min(10, rate * 20));
+                          const active = monitoringCity === city.city;
+                          return (
+                            <CircleMarker
+                              key={`marker-${city.city}`}
+                              center={[lat, lon]}
+                              radius={radius}
+                              pathOptions={{
+                                color: active ? '#ffffff' : '#fde68a',
+                                weight: active ? 3 : 2,
+                                fillColor: active ? '#ef4444' : '#f59e0b',
+                                fillOpacity: 0.85,
+                              }}
+                              eventHandlers={{
+                                click: () =>
+                                  setMonitoringCity((prev) => (prev === city.city ? '' : city.city)),
+                              }}
+                            >
+                              <LeafletTooltip direction="top" offset={[0, -8]} opacity={0.95}>
+                                <div className="text-xs">
+                                  <div className="font-semibold">{city.city}</div>
+                                  <div>
+                                    {city.failures}/{city.total} ({(rate * 100).toFixed(1)}%)
                                   </div>
-                                </LeafletTooltip>
-                              </CircleMarker>
-                            );
-                          })}
-                        </MapContainer>
-                      </div>
-                      <p className="text-[11px] text-gray-500 mt-2">
-                        Map data: OpenStreetMap. Click marker to filter.
-                      </p>
+                                </div>
+                              </LeafletTooltip>
+                            </CircleMarker>
+                          );
+                        })}
+                      </MapContainer>
                     </div>
-                    <div className="bg-gray-50 rounded-lg border border-gray-200 p-3 overflow-auto max-h-72">
-                      <div className="text-xs font-semibold text-gray-700 mb-2">Top Cities</div>
-                      <div className="space-y-1">
-                        {sortedCities.slice(0, 12).map((city) => {
+                    <p className="text-[11px] text-gray-500 mt-2">
+                      Map data: OpenStreetMap. Click marker to filter.
+                    </p>
+                    {mapCities.length === 0 && (
+                      <p className="text-xs text-gray-500 mt-1">
+                        No city coordinate data available yet.
+                      </p>
+                    )}
+                  </div>
+                  <div className="bg-gray-50 rounded-lg border border-gray-200 p-3 overflow-auto max-h-72">
+                    <div className="text-xs font-semibold text-gray-700 mb-2">Top Cities</div>
+                    <div className="space-y-1">
+                      {sortedCities.length === 0 ? (
+                        <p className="text-xs text-gray-500">No city data yet.</p>
+                      ) : (
+                        sortedCities.slice(0, 12).map((city) => {
                           const active = monitoringCity === city.city;
                           return (
                             <button
@@ -869,11 +874,11 @@ const OTADashboard = () => {
                               </div>
                             </button>
                           );
-                        })}
-                      </div>
+                        })
+                      )}
                     </div>
                   </div>
-                )}
+                </div>
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
