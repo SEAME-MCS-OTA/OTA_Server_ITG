@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${ROOT_DIR}/docker-compose.ota-stack.yml"
 LEGACY_OTA_GH_COMPOSE="${ROOT_DIR}/OTA_GH/docker-compose.yml"
 ENV_FILE="${ROOT_DIR}/.env"
+DOCKER_CMD=(docker)
 
 cd "${ROOT_DIR}"
 
@@ -31,6 +32,24 @@ upsert_env_var() {
   fi
 }
 
+ensure_docker_access() {
+  if docker info >/dev/null 2>&1; then
+    DOCKER_CMD=(docker)
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    echo "[warn] Docker daemon permission denied for current user. Falling back to sudo."
+    if sudo docker info >/dev/null 2>&1; then
+      DOCKER_CMD=(sudo docker)
+      return 0
+    fi
+  fi
+
+  echo "[error] Cannot access Docker daemon. Re-login after adding user to docker group, or run with sudo." >&2
+  exit 1
+}
+
 # RPi must download firmware from a host-reachable URL.
 # If not provided, auto-derive a sane default from current host IP.
 if [[ -z "${OTA_GH_FIRMWARE_BASE_URL:-}" ]]; then
@@ -46,18 +65,20 @@ fi
 
 # If legacy OTA_GH stack is running, it usually occupies 8080/1883 and
 # prevents this unified stack from starting. Stop it automatically.
+ensure_docker_access
+
 if [[ "${OTA_STACK_SKIP_LEGACY_DOWN:-0}" != "1" ]] && [[ -f "${LEGACY_OTA_GH_COMPOSE}" ]]; then
-  if docker compose -f "${LEGACY_OTA_GH_COMPOSE}" ps -q | grep -q .; then
+  if "${DOCKER_CMD[@]}" compose -f "${LEGACY_OTA_GH_COMPOSE}" ps -q | grep -q .; then
     echo "[info] Stopping legacy OTA_GH stack to avoid port conflicts..."
-    docker compose -f "${LEGACY_OTA_GH_COMPOSE}" down
+    "${DOCKER_CMD[@]}" compose -f "${LEGACY_OTA_GH_COMPOSE}" down
   fi
 fi
 
-docker compose -f "${COMPOSE_FILE}" up -d --build
+"${DOCKER_CMD[@]}" compose -f "${COMPOSE_FILE}" up -d --build
 
 echo
 echo "== OTA stack services =="
-docker compose -f "${COMPOSE_FILE}" ps
+"${DOCKER_CMD[@]}" compose -f "${COMPOSE_FILE}" ps
 echo
 echo "OTA_GH API:        http://localhost:${OTA_GH_SERVER_PORT:-8080}"
 echo "OTA_GH Dashboard:  http://localhost:${OTA_GH_DASHBOARD_PORT:-3001}"

@@ -45,6 +45,8 @@ from .ota_logic import (
     start_queue_flusher,
 )
 from .mqtt_utils import parse_mqtt_update_command
+from .log_collector import OTALogCollector
+from .llm_verify_client import request_llm_verification
 
 app = Flask(__name__)
 logging.basicConfig(
@@ -371,6 +373,13 @@ def _cfg_int(value: Any, default: int) -> int:
         return default
 
 
+def _normalize_mqtt_transport(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in {"ws", "wss", "websocket", "websockets"}:
+        return "websockets"
+    return "tcp"
+
+
 def _format_mqtt_topic(template: str, device_id: str) -> str:
     topic = str(template or "").strip()
     if not topic:
@@ -478,7 +487,7 @@ def _host_from_url(raw_url: Any) -> str:
         return ""
 
 
-def _create_mqtt_client(client_id: str):
+def _create_mqtt_client(client_id: str, transport: str = "tcp"):
     """
     Create a paho client compatible with both v1.x and v2.x.
     v2.x may require callback_api_version and defaults to v2 callbacks.
@@ -487,6 +496,7 @@ def _create_mqtt_client(client_id: str):
         "client_id": client_id,
         "protocol": mqtt.MQTTv311,
         "clean_session": True,
+        "transport": _normalize_mqtt_transport(transport),
     }
     callback_api = getattr(mqtt, "CallbackAPIVersion", None)
     if callback_api is not None:
@@ -517,6 +527,15 @@ class MQTTCommandBridge:
         self.qos = _cfg_int(cfg.get("mqtt_qos", 1), 1)
         self.username = str(cfg.get("mqtt_username", "")).strip()
         self.password = str(cfg.get("mqtt_password", "")).strip()
+        self.transport = _normalize_mqtt_transport(cfg.get("mqtt_transport", "tcp"))
+        ws_path = str(cfg.get("mqtt_ws_path", "/mqtt")).strip() or "/mqtt"
+        self.ws_path = ws_path if ws_path.startswith("/") else f"/{ws_path}"
+        auto_tls = self.transport == "websockets" and self.broker_port == 443
+        self.tls_enabled = _cfg_bool(cfg.get("mqtt_tls"), default=auto_tls)
+        self.tls_insecure = _cfg_bool(cfg.get("mqtt_tls_insecure"), default=False)
+        self.tls_ca_certs = str(cfg.get("mqtt_tls_ca_certs", "")).strip()
+        self.tls_certfile = str(cfg.get("mqtt_tls_certfile", "")).strip()
+        self.tls_keyfile = str(cfg.get("mqtt_tls_keyfile", "")).strip()
         self.device_id = str(cfg.get("device_id", "")).strip()
         default_client_id = f"ota-backend-{self.device_id or 'device'}"
         self.client_id = str(cfg.get("mqtt_client_id", default_client_id)).strip() or default_client_id
@@ -553,13 +572,41 @@ class MQTTCommandBridge:
             return
 
         try:
-            client = _create_mqtt_client(self.client_id)
+            client = _create_mqtt_client(self.client_id, self.transport)
             client.on_connect = self._on_connect
             client.on_disconnect = self._on_disconnect
             client.on_message = self._on_message
 
             if self.username:
                 client.username_pw_set(self.username, self.password)
+
+            if self.transport == "websockets":
+                try:
+                    client.ws_set_options(path=self.ws_path)
+                except Exception as ex:
+                    logger.warning("MQTT websocket setup failed: %s", ex)
+                    _append_runtime_log(f"mqtt ws setup failed: {ex.__class__.__name__}")
+                    return
+
+            if self.tls_enabled:
+                try:
+                    tls_kwargs: Dict[str, Any] = {}
+                    if self.tls_ca_certs:
+                        tls_kwargs["ca_certs"] = self.tls_ca_certs
+                    if self.tls_certfile:
+                        tls_kwargs["certfile"] = self.tls_certfile
+                    if self.tls_keyfile:
+                        tls_kwargs["keyfile"] = self.tls_keyfile
+                    if tls_kwargs:
+                        client.tls_set(**tls_kwargs)
+                    else:
+                        client.tls_set()
+                    if hasattr(client, "tls_insecure_set"):
+                        client.tls_insecure_set(bool(self.tls_insecure))
+                except Exception as ex:
+                    logger.warning("MQTT TLS setup failed: %s", ex)
+                    _append_runtime_log(f"mqtt tls setup failed: {ex.__class__.__name__}")
+                    return
 
             # Never block backend startup on broker reachability.
             # connect_async() schedules connection in the network loop thread.
@@ -577,6 +624,9 @@ class MQTTCommandBridge:
             self.client = client
             _append_runtime_log(
                 f"mqtt connecting host={self.broker_host}:{self.broker_port} "
+                f"transport={self.transport} "
+                f"ws_path={self.ws_path if self.transport == 'websockets' else '-'} "
+                f"tls={'on' if self.tls_enabled else 'off'} "
                 f"topic={self._topic_cmd()} qos={self.qos}"
             )
         except Exception as ex:
@@ -703,6 +753,8 @@ def health():
         "ok": True,
         "mqtt_enabled": bool(MQTT_BRIDGE and MQTT_BRIDGE.enabled),
         "mqtt_connected": bool(MQTT_BRIDGE and MQTT_BRIDGE.is_connected()),
+        "mqtt_transport": str(getattr(MQTT_BRIDGE, "transport", "tcp") or "tcp"),
+        "mqtt_tls": bool(getattr(MQTT_BRIDGE, "tls_enabled", False)),
     })
 
 @app.get("/ota/status")
@@ -921,10 +973,80 @@ def _start_ota_job(ota_id: str, url: str, target_version: str, trigger_source: s
                 state.phase = None
                 return
 
+            _log("APPLY OK - RAUC install succeeded")
+            _publish_mqtt_progress(target_version, 75, "RAUC install done, LLM verification...")
+
+            # ── LLM 2차 검증 ──────────────────────────
+            _log("LLM_VERIFY START")
+            _publish_mqtt_status("verifying", target_version, "LLM 2차 검증 진행 중")
+            try:
+                log_collector = OTALogCollector()
+                log_collector.record_rauc_result(rc, "RAUC install succeeded", "")
+                log_collector.record_signature_verification(True)
+                log_collector.record_firmware_file_info(bundle_path, 0)
+                log_collector.record_server_info(url)
+                for mqtt_cmd in ota_log:
+                    if mqtt_cmd.startswith("SOURCE"):
+                        log_collector.record_mqtt_command("ota/update/trigger", mqtt_cmd)
+
+                verification_log = log_collector.build_verification_log(
+                    current_version=state.current_version,
+                    new_version=target_version,
+                    vehicle_id=CFG.get("device_id", "unknown"),
+                )
+
+                server_url = CFG.get("collector_url", "").rsplit("/", 1)[0]  # strip /ingest
+                if not server_url:
+                    server_url = f"http://{CFG.get('mqtt_broker_host', 'localhost')}:8080"
+
+                llm_result = request_llm_verification(
+                    server_url=server_url,
+                    ota_log=verification_log,
+                    timeout=30,
+                )
+
+                _log(f"LLM_VERIFY RESULT: {llm_result['decision']}")
+                _log(f"LLM_VERIFY REASON: {llm_result['reason']}")
+
+                if llm_result["decision"] == "REJECT":
+                    state.event = EVENT_FAIL
+                    state.last_error = "LLM_REJECT"
+                    error = {
+                        "code": "LLM_REJECT",
+                        "message": f"LLM rejected: {llm_result['reason']}",
+                        "retryable": False,
+                    }
+                    event = build_event(CFG, ota_id, state.current_version, target_version,
+                                        PHASE_APPLY, EVENT_FAIL, error, ota_log)
+                    _write_event(CFG, ota_id, event)
+                    _post_event(CFG, event)
+                    _publish_mqtt_status("failed", target_version,
+                                         f"LLM REJECT: {llm_result['reason'][:100]}")
+                    state.phase = None
+                    return
+
+                _log("LLM_VERIFY APPROVED")
+            except Exception as llm_ex:
+                _log(f"LLM_VERIFY ERROR: {llm_ex}, Fail-safe REJECT")
+                state.event = EVENT_FAIL
+                state.last_error = "LLM_ERROR"
+                error = {
+                    "code": "LLM_ERROR",
+                    "message": f"LLM verification failed: {llm_ex}",
+                    "retryable": False,
+                }
+                event = build_event(CFG, ota_id, state.current_version, target_version,
+                                    PHASE_APPLY, EVENT_FAIL, error, ota_log)
+                _write_event(CFG, ota_id, event)
+                _post_event(CFG, event)
+                _publish_mqtt_status("failed", target_version, "LLM verification error, Fail-safe REJECT")
+                state.phase = None
+                return
+            # ── LLM 2차 검증 끝 ──────────────────────
+
             state.phase = PHASE_REBOOT
             state.event = EVENT_OK
             state.current_version = target_version
-            _log("APPLY OK")
             _publish_mqtt_progress(target_version, 90, "Apply complete")
             event = build_event(CFG, ota_id, state.current_version, target_version,
                                 PHASE_REBOOT, EVENT_OK, {}, ota_log)

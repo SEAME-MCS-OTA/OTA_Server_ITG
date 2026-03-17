@@ -8,6 +8,24 @@ from dotenv import load_dotenv
 # .env 파일 로드
 load_dotenv()
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+
+
+def _mqtt_transport() -> str:
+    raw = str(os.getenv('MQTT_TRANSPORT', 'tcp') or '').strip().lower()
+    if raw in {'ws', 'wss', 'websocket', 'websockets'}:
+        return 'websockets'
+    return 'tcp'
+
+
+def _mqtt_ws_path() -> str:
+    raw = str(os.getenv('MQTT_WS_PATH', '/mqtt') or '').strip() or '/mqtt'
+    return raw if raw.startswith('/') else f'/{raw}'
+
 
 class Config:
     """서버 설정 클래스"""
@@ -40,11 +58,18 @@ class Config:
     # MQTT 설정
     MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
     MQTT_BROKER_PORT = int(os.getenv('MQTT_BROKER_PORT', '1883'))
+    MQTT_TRANSPORT = _mqtt_transport()
+    MQTT_WS_PATH = _mqtt_ws_path()
     MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'ota-server')
     MQTT_USERNAME = os.getenv('MQTT_USERNAME', '')
     MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', '')
     MQTT_KEEPALIVE = int(os.getenv('MQTT_KEEPALIVE', '60'))
     MQTT_QOS = int(os.getenv('MQTT_QOS', 2))
+    MQTT_TLS_ENABLED = _env_bool('MQTT_TLS_ENABLED', default=False)
+    MQTT_TLS_INSECURE = _env_bool('MQTT_TLS_INSECURE', default=False)
+    MQTT_CA_CERTS = os.getenv('MQTT_CA_CERTS', '')
+    MQTT_CERTFILE = os.getenv('MQTT_CERTFILE', '')
+    MQTT_KEYFILE = os.getenv('MQTT_KEYFILE', '')
     
     # MQTT 토픽 템플릿
     MQTT_TOPIC_CMD = 'ota/{vehicle_id}/cmd'
@@ -83,6 +108,12 @@ class Config:
         '1', 'true', 'yes', 'y', 'on'
     }
     
+    # LLM 2차 검증 설정
+    LLM_VERIFICATION_ENABLED = os.getenv('LLM_VERIFY', 'true').lower() in {
+        '1', 'true', 'yes', 'y', 'on'
+    }
+    LLM_MODEL = os.getenv('LLM_MODEL', 'claude-sonnet-4-20250514')
+
     # 로깅 설정
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
     

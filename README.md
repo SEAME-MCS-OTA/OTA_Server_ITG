@@ -403,6 +403,64 @@ docker compose -f /home/yg/OTA_HEADUNIT/docker-compose.ota-stack.yml ps
 docker compose -f /home/yg/OTA_HEADUNIT/docker-compose.ota-stack.yml logs -f ota_gh_server ota_vlm_backend ota_gh_mosquitto
 ```
 
+### MQTT over WebSocket (Method 3, Cloudflare-friendly)
+
+목표:
+
+- Dashboard/API/firmware는 HTTPS tunnel로 공개
+- MQTT는 WebSocket(`ws`/`wss`) transport로 동일 브로커 사용
+
+서버(OTA_GH) 설정 예시 (`/home/yg/OTA_HEADUNIT/.env`):
+
+```bash
+OTA_GH_MQTT_TRANSPORT=websockets
+OTA_GH_MQTT_WS_PATH=/mqtt
+OTA_GH_MQTT_TLS_ENABLED=false
+OTA_GH_MQTT_TLS_INSECURE=false
+```
+
+디바이스(ota-backend `config.json`) 설정 예시:
+
+```json
+{
+  "mqtt_enabled": true,
+  "mqtt_broker_host": "mqtt.example.com",
+  "mqtt_broker_port": 443,
+  "mqtt_transport": "websockets",
+  "mqtt_ws_path": "/mqtt",
+  "mqtt_tls": true,
+  "mqtt_tls_insecure": false
+}
+```
+
+Cloudflare tunnel ingress 예시:
+
+```yaml
+ingress:
+  - hostname: dash.example.com
+    service: http://localhost:3001
+  - hostname: ota.example.com
+    service: http://localhost:8080
+  - hostname: mqtt.example.com
+    service: http://localhost:9001
+  - service: http_status:404
+```
+
+적용 후 재기동:
+
+```bash
+cd /home/yg/OTA_HEADUNIT
+./tools/ota-stack-up.sh
+```
+
+상태 확인:
+
+```bash
+curl -sS http://localhost:8080/health
+```
+
+헬스 응답에 `mqtt_transport`, `mqtt_ws_path`, `mqtt_tls_enabled` 필드가 표시됩니다.
+
 ---
 
 ## 8. Firmware Management (Upload/Activate/Delete)

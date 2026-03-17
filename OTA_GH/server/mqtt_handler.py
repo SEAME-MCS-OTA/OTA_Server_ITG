@@ -17,6 +17,36 @@ from monitoring_reporter import publish_update_result, should_report_final_statu
 logger = logging.getLogger(__name__)
 
 
+def normalize_completed_status_by_version(
+    status: str,
+    prev_version: str,
+    target_version: str,
+    message: str = "",
+) -> tuple[str, str]:
+    """
+    서버 성공 판정 보정:
+    - completed 수신 시, 이전 버전과 target_version이 동일하면 실패로 강등한다.
+    - 비교 기준값이 없는 경우(prev_version empty)는 기존 completed를 유지한다.
+    """
+    status_norm = str(status or "").strip().lower()
+    if status_norm != "completed":
+        return status_norm, str(message or "")
+
+    prev = str(prev_version or "").strip()
+    target = str(target_version or "").strip()
+    msg = str(message or "")
+
+    if not target:
+        reason = "target_version missing"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    if prev and prev == target:
+        reason = f"version unchanged: {prev}"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    return "completed", msg
+
+
 class MQTTHandler:
     """MQTT 메시지 처리 핸들러"""
     
@@ -41,6 +71,7 @@ class MQTTHandler:
                 "client_id": Config.MQTT_CLIENT_ID,
                 "protocol": mqtt.MQTTv311,
                 "clean_session": True,
+                "transport": Config.MQTT_TRANSPORT,
             }
             callback_api = getattr(mqtt, "CallbackAPIVersion", None)
             if callback_api is not None:
@@ -55,6 +86,24 @@ class MQTTHandler:
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
             self.client.on_message = self._on_message
+
+            if Config.MQTT_TRANSPORT == "websockets":
+                self.client.ws_set_options(path=Config.MQTT_WS_PATH)
+
+            if Config.MQTT_TLS_ENABLED:
+                tls_kwargs = {}
+                if Config.MQTT_CA_CERTS:
+                    tls_kwargs["ca_certs"] = Config.MQTT_CA_CERTS
+                if Config.MQTT_CERTFILE:
+                    tls_kwargs["certfile"] = Config.MQTT_CERTFILE
+                if Config.MQTT_KEYFILE:
+                    tls_kwargs["keyfile"] = Config.MQTT_KEYFILE
+                if tls_kwargs:
+                    self.client.tls_set(**tls_kwargs)
+                else:
+                    self.client.tls_set()
+                if Config.MQTT_TLS_INSECURE:
+                    self.client.tls_insecure_set(True)
             
             # 인증 설정 (있는 경우)
             if Config.MQTT_USERNAME and Config.MQTT_PASSWORD:
@@ -63,7 +112,12 @@ class MQTTHandler:
                     Config.MQTT_PASSWORD
                 )
             
-            logger.info("MQTT client initialized")
+            logger.info(
+                "MQTT client initialized transport=%s ws_path=%s tls=%s",
+                Config.MQTT_TRANSPORT,
+                Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == "websockets" else "-",
+                "on" if Config.MQTT_TLS_ENABLED else "off",
+            )
             
         except Exception as e:
             logger.error(f"Failed to initialize MQTT client: {e}")
@@ -184,21 +238,28 @@ class MQTTHandler:
             # Flask 애플리케이션 컨텍스트 내에서 DB 작업 수행
             with self.app_context():
                 try:
-                    status = data.get('status')
+                    incoming_status = data.get('status')
                     target_version = data.get('target_version')
                     message = data.get('message', '')
                     
-                    if not status or not target_version:
+                    if not incoming_status or not target_version:
                         logger.warning(f"Missing required fields in status message: {data}")
                         return
                     
                     # Vehicle upsert + status 반영
-                    vehicle = self._upsert_vehicle(vehicle_id, default_status=status)
+                    vehicle = self._upsert_vehicle(vehicle_id, default_status=incoming_status)
                     prev_version = vehicle.current_version
-                    vehicle.status = status
                     vehicle.last_seen = datetime.utcnow()
 
-                    # completed 상태면 current_version 업데이트
+                    status, message = normalize_completed_status_by_version(
+                        incoming_status,
+                        prev_version=str(prev_version or ""),
+                        target_version=str(target_version or ""),
+                        message=message,
+                    )
+                    vehicle.status = status
+
+                    # 보정 이후 completed 상태일 때만 current_version 업데이트
                     if status == 'completed':
                         vehicle.current_version = target_version
 

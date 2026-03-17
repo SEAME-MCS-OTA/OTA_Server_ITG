@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL 데이터베이스
   postgres:
@@ -67,6 +65,13 @@ services:
       # MQTT
       MQTT_BROKER_HOST: mosquitto
       MQTT_BROKER_PORT: 1883
+      MQTT_TRANSPORT: ${MQTT_TRANSPORT:-tcp}
+      MQTT_WS_PATH: ${MQTT_WS_PATH:-/mqtt}
+      MQTT_TLS_ENABLED: ${MQTT_TLS_ENABLED:-false}
+      MQTT_TLS_INSECURE: ${MQTT_TLS_INSECURE:-false}
+      MQTT_CA_CERTS: ${MQTT_CA_CERTS:-}
+      MQTT_CERTFILE: ${MQTT_CERTFILE:-}
+      MQTT_KEYFILE: ${MQTT_KEYFILE:-}
       MQTT_QOS: 2
       # Firmware
       FIRMWARE_DIR: /app/firmware_files

@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 import smtplib
 from email.message import EmailMessage

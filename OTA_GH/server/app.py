@@ -2,10 +2,12 @@
 OTA Server - Main Application
 Flask REST API 서버
 """
+import json
 import os
 import logging
 import hashlib
 import shutil
+import sqlite3
 import time
 import mimetypes
 import threading
@@ -24,6 +26,7 @@ from config import Config
 from models import db, Vehicle, Firmware, UpdateHistory
 from mqtt_handler import MQTTHandler
 from monitoring_reporter import publish_update_result, should_report_final_status
+from llm_verifier import call_llm_verification, preprocess_log, save_verification_result
 
 # 로깅 설정
 logging.basicConfig(
@@ -249,6 +252,36 @@ def compare_versions(v1: str, v2: str) -> int:
             return 0
 
 
+def normalize_completed_status_by_version(
+    status: str,
+    prev_version: str,
+    target_version: str,
+    message: str = "",
+) -> tuple[str, str]:
+    """
+    서버 성공 판정 보정:
+    - completed 수신 시, 이전 버전과 target_version이 동일하면 실패로 강등한다.
+    - 비교 기준값이 없는 경우(prev_version empty)는 기존 completed를 유지한다.
+    """
+    status_norm = str(status or "").strip().lower()
+    if status_norm != "completed":
+        return status_norm, str(message or "")
+
+    prev = str(prev_version or "").strip()
+    target = str(target_version or "").strip()
+    msg = str(message or "")
+
+    if not target:
+        reason = "target_version missing"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    if prev and prev == target:
+        reason = f"version unchanged: {prev}"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    return "completed", msg
+
+
 def parse_bool(value, default: bool = False) -> bool:
     """문자열/폼 값을 불리언으로 변환"""
     if value is None:
@@ -361,7 +394,10 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
-        'mqtt_connected': mqtt_handler.is_connected() if mqtt_handler else False
+        'mqtt_connected': mqtt_handler.is_connected() if mqtt_handler else False,
+        'mqtt_transport': Config.MQTT_TRANSPORT,
+        'mqtt_ws_path': Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == 'websockets' else '',
+        'mqtt_tls_enabled': Config.MQTT_TLS_ENABLED,
     }), 200
 
 
@@ -524,30 +560,37 @@ def report_status():
         
         vehicle_id = data['vehicle_id']
         target_version = data['target_version']
-        status = data['status']
+        incoming_status = data['status']
         progress = data.get('progress', 0)
         message = data.get('message', '')
         
         # 유효한 status 값 검증
         valid_statuses = ['downloading', 'verifying', 'installing', 'completed', 'failed']
-        if status not in valid_statuses:
-            return jsonify({'error': f'Invalid status: {status}'}), 400
+        if incoming_status not in valid_statuses:
+            return jsonify({'error': f'Invalid status: {incoming_status}'}), 400
         
         logger.info(
-            f"Status report from {vehicle_id}: {status} "
+            f"Status report from {vehicle_id}: {incoming_status} "
             f"({progress}%) for version {target_version}"
         )
         
         # Vehicle 조회 또는 생성
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if not vehicle:
-            vehicle = Vehicle(vehicle_id=vehicle_id, status=status)
+            vehicle = Vehicle(vehicle_id=vehicle_id, status=incoming_status)
             db.session.add(vehicle)
         else:
-            vehicle.status = status
             vehicle.last_seen = datetime.utcnow()
-        
-        # completed 상태면 current_version 업데이트
+        prev_version = str(vehicle.current_version or "").strip()
+
+        status, message = normalize_completed_status_by_version(
+            incoming_status,
+            prev_version=prev_version,
+            target_version=target_version,
+            message=message,
+        )
+
+        vehicle.status = status
         if status == 'completed':
             vehicle.current_version = target_version
         
@@ -572,7 +615,7 @@ def report_status():
             history = UpdateHistory(
                 vehicle_id=vehicle_id,
                 firmware_id=firmware.id if firmware else None,
-                from_version=vehicle.current_version if status != 'completed' else None,
+                from_version=prev_version or None,
                 target_version=target_version,
                 status=status,
                 progress=progress,
@@ -1087,6 +1130,112 @@ def trigger_update():
     except Exception as e:
         logger.error(f"Error triggering update: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
+
+
+# ── LLM 런타임 토글 상태 ──────────────────────
+_llm_enabled = Config.LLM_VERIFICATION_ENABLED
+
+
+@app.route('/api/v1/llm/config', methods=['GET'])
+def get_llm_config():
+    """LLM 검증 설정 조회."""
+    return jsonify({
+        'enabled': _llm_enabled,
+        'model': Config.LLM_MODEL,
+    })
+
+
+@app.route('/api/v1/llm/config', methods=['POST'])
+def set_llm_config():
+    """LLM 검증 ON/OFF 런타임 토글."""
+    global _llm_enabled
+    data = request.get_json() or {}
+    if 'enabled' in data:
+        _llm_enabled = bool(data['enabled'])
+        logger.info(f"LLM verification toggled: {'ON' if _llm_enabled else 'OFF'}")
+    return jsonify({
+        'enabled': _llm_enabled,
+        'model': Config.LLM_MODEL,
+    })
+
+
+@app.route('/api/ota/verify', methods=['POST'])
+def verify_ota_update():
+    """
+    OTA 업데이트 LLM 2차 검증 엔드포인트.
+    클라이언트로부터 OTA 로그를 수신하고, LLM 기반 검증 결과를 반환한다.
+    """
+    try:
+        ota_log = request.get_json()
+        if not ota_log:
+            return jsonify({"error": "No JSON body provided"}), 400
+
+        required_fields = ["firmware_metadata", "process_log", "device_state"]
+        for field in required_fields:
+            if field not in ota_log:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        if _llm_enabled:
+            preprocessed = preprocess_log(ota_log)
+            result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
+        else:
+            # LLM OFF: 로그만 저장하고 무조건 APPROVE
+            result = {
+                "decision": "APPROVE",
+                "reason": "LLM verification disabled. Relying on RAUC integrity check only.",
+                "raw_response": None,
+            }
+
+        save_verification_result(ota_log, result)
+
+        logger.info(
+            "OTA verify: vehicle=%s decision=%s llm_enabled=%s",
+            ota_log.get("device_state", {}).get("vehicle_id", "unknown"),
+            result["decision"],
+            _llm_enabled,
+        )
+
+        return jsonify({
+            "decision": result["decision"],
+            "reason": result["reason"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        })
+
+    except Exception as e:
+        logger.error(f"Error in verify_ota_update: {e}", exc_info=True)
+        return jsonify({
+            "decision": "REJECT",
+            "reason": f"서버 내부 오류로 Fail-safe REJECT: {str(e)}",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+
+
+@app.route('/api/v1/llm/results', methods=['GET'])
+def list_llm_results():
+    """LLM 검증 결과 목록 조회 (대시보드용)."""
+    try:
+        from llm_verifier import _get_verification_db
+        limit = request.args.get('limit', 50, type=int)
+        conn = _get_verification_db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM verification_results ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        results = []
+        for row in rows:
+            r = dict(row)
+            try:
+                r['ota_log'] = json.loads(r.get('ota_log_json') or '{}')
+            except Exception:
+                r['ota_log'] = {}
+            r.pop('ota_log_json', None)
+            results.append(r)
+        return jsonify({'results': results, 'total': len(results), 'llm_enabled': _llm_enabled})
+    except Exception as e:
+        logger.error(f"Error listing LLM results: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/v1/vehicles', methods=['GET'])

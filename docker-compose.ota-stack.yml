@@ -5,6 +5,8 @@ services:
       POSTGRES_DB: ${OTA_GH_DB_NAME:-ota_db}
       POSTGRES_USER: ${OTA_GH_DB_USER:-ota_user}
       POSTGRES_PASSWORD: ${OTA_GH_DB_PASSWORD:-ota_password}
+    ports:
+      - "${OTA_GH_DB_PORT:-5432}:5432"
     volumes:
       - ota_gh_postgres_data:/var/lib/postgresql/data
       - ./OTA_GH/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
@@ -52,6 +54,13 @@ services:
       FIRMWARE_BASE_URL: ${OTA_GH_FIRMWARE_BASE_URL:-}
       MQTT_BROKER_HOST: ota_gh_mosquitto
       MQTT_BROKER_PORT: 1883
+      MQTT_TRANSPORT: ${OTA_GH_MQTT_TRANSPORT:-tcp}
+      MQTT_WS_PATH: ${OTA_GH_MQTT_WS_PATH:-/mqtt}
+      MQTT_TLS_ENABLED: ${OTA_GH_MQTT_TLS_ENABLED:-false}
+      MQTT_TLS_INSECURE: ${OTA_GH_MQTT_TLS_INSECURE:-false}
+      MQTT_CA_CERTS: ${OTA_GH_MQTT_CA_CERTS:-}
+      MQTT_CERTFILE: ${OTA_GH_MQTT_CERTFILE:-}
+      MQTT_KEYFILE: ${OTA_GH_MQTT_KEYFILE:-}
       MQTT_QOS: 2
       FIRMWARE_DIR: /app/firmware_files
       LOG_LEVEL: ${OTA_GH_LOG_LEVEL:-INFO}
@@ -63,6 +72,9 @@ services:
       LOCAL_DEVICE_MAP: ${OTA_GH_LOCAL_DEVICE_MAP:-vw-ivi-0026@192.168.86.250:8080}
       LOCAL_PROBE_INTERVAL_SEC: ${OTA_GH_LOCAL_PROBE_INTERVAL_SEC:-5}
       LOCAL_PROBE_TIMEOUT_SEC: ${OTA_GH_LOCAL_PROBE_TIMEOUT_SEC:-1.5}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_VERIFY: ${OTA_GH_LLM_VERIFY:-true}
+      LLM_MODEL: ${OTA_GH_LLM_MODEL:-claude-sonnet-4-20250514}
     ports:
       - "${OTA_GH_SERVER_PORT:-8080}:8080"
     volumes:

@@ -3,7 +3,7 @@
 Flask + PostgreSQL + MQTT 기반 OTA(Over-The-Air) 업데이트 데모 시스템입니다.  
 서버가 차량(클라이언트)의 버전을 관리하고, 펌웨어 배포 및 업데이트 상태를 수집합니다.  
 React 대시보드로 차량/펌웨어 상태를 모니터링할 수 있습니다.
-
+10년동안 연평균 20퍼를 상회하는 수익률은 진짜 미친거아냐?
 ## 1. 구성 요소
 
 - `server/`: OTA REST API 서버(Flask), DB 모델, MQTT 핸들러
@@ -56,7 +56,7 @@ chmod +x scripts/*.sh
 ./scripts/create_firmware.sh 1.0.1
 ```
 
-### 4.2 펌웨어 업로드
+### 4.2 펌웨어 업로드 
 
 ```bash
 ./scripts/upload_firmware_1.0.1.sh
@@ -78,7 +78,7 @@ curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
   -H "Content-Type: application/json" \
   -d '{"vehicle_id":"vehicle_001","version":"1.0.1"}'
 ```
-
+잠깐 지금까지 너가 한걸 정리해봐
 ### 4.4 상태 확인
 
 ```bash
@@ -104,6 +104,10 @@ curl -X POST http://localhost:8080/api/v1/admin/trigger-update \
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_PORT`
 - `SERVER_PORT`, `SECRET_KEY`, `DEBUG`, `LOG_LEVEL`
 - `MQTT_BROKER_PORT`
+- `MQTT_TRANSPORT` (`tcp` 또는 `websockets`)
+- `MQTT_WS_PATH` (예: `/mqtt`, websockets 사용 시)
+- `MQTT_TLS_ENABLED`, `MQTT_TLS_INSECURE`
+- `MQTT_CA_CERTS`, `MQTT_CERTFILE`, `MQTT_KEYFILE`
 - `LOCAL_DEVICE_MAP` (예: `vw-ivi-0026@192.168.86.250:8080`)
 - `LOCAL_PROBE_INTERVAL_SEC`, `LOCAL_PROBE_TIMEOUT_SEC`
 

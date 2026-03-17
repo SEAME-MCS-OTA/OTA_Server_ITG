@@ -55,6 +55,13 @@ class Config:
     # ========== 동작 모드 ==========
     MODE = os.getenv('OTA_MODE', 'mqtt')  # mqtt or polling
     
+    # ========== LLM 2차 검증 설정 ==========
+    LLM_VERIFY_ENABLED = os.getenv('LLM_VERIFY', 'true').lower() in {
+        '1', 'true', 'yes', 'y', 'on'
+    }
+    LLM_VERIFY_SERVER_URL = os.getenv('LLM_VERIFY_SERVER_URL', '')  # 빈 값이면 SERVER_URL 사용
+    LLM_VERIFY_TIMEOUT = int(os.getenv('LLM_VERIFY_TIMEOUT', '30'))
+
     # ========== 로깅 설정 ==========
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
        

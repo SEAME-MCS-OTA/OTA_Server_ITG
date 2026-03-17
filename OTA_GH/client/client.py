@@ -24,6 +24,8 @@ from error_reporter import (
     report_ota_error,
     report_ota_success,
 )
+from log_collector import OTALogCollector
+from llm_verify_client import request_llm_verification
 
 # 로깅 설정
 logging.basicConfig(
@@ -41,6 +43,7 @@ class OTAClient:
         self.current_version = self._load_version()
         self.state = 'idle'
         self.mqtt_client = None
+        self.log_collector: Optional[OTALogCollector] = None
         logger.info(f"Client initialized: {Config.VEHICLE_ID} v{self.current_version}")
         if Config.MONITOR_INGEST_URL:
             logger.info(f"Monitoring ingest mirror enabled: {Config.MONITOR_INGEST_URL}")
@@ -520,32 +523,117 @@ class OTAClient:
     # 업데이트 실행
     
     def perform_update(self, firmware_info: Dict) -> bool:
-        """전체 업데이트 프로세스"""
+        """전체 업데이트 프로세스 (LLM 2차 검증 포함)"""
         version = firmware_info['version']
         start_version = self.current_version
-        
+
+        # LLM 검증용 로그 수집기 초기화
+        self.log_collector = OTALogCollector()
+        self.log_collector.record_server_info(
+            trigger_server=Config.SERVER_URL,
+        )
+
         try:
             logger.info(f"Update started: {self.current_version} -> {version}")
-            
+
             # 다운로드
+            self.log_collector.mark_download_start()
             filepath = self.download_firmware(firmware_info)
             if not filepath:
                 return False
-            
-            # 검증
+            self.log_collector.mark_download_end()
+
+            # 펌웨어 파일 정보 기록
+            self.log_collector.record_firmware_file_info(
+                filepath=filepath,
+                expected_size=firmware_info.get('size', 0),
+            )
+            self.log_collector.record_bundle_hash(f"sha256:{firmware_info.get('sha256', '')}")
+
+            # SHA256 검증
             self._report_status('verifying', version)
             if not self.verify_firmware(filepath, firmware_info['sha256'], version):
                 self._report_status('failed', version, 'Verification failed')
                 return False
-            
+            self.log_collector.record_signature_verification(True)
+
             # 설치
             if not self.install_firmware(filepath, version):
                 self._report_status('failed', version, 'Installation failed')
                 return False
-            
+
+            # RAUC 설치 결과 기록 (file_copy/systemd 모드에서는 RAUC를 직접 사용하지 않으므로 성공으로 기록)
+            self.log_collector.record_rauc_result(
+                exit_code=0,
+                stdout="Installation completed successfully.",
+                stderr="",
+            )
+
+            # ── [NEW] LLM 2차 검증 ──────────────────────────────
+            if Config.LLM_VERIFY_ENABLED:
+                logger.info("Requesting LLM secondary verification...")
+                self._report_status('verifying', version, 'LLM secondary verification')
+
+                verification_log = self.log_collector.build_verification_log(
+                    current_version=start_version,
+                    new_version=version,
+                    vehicle_id=Config.VEHICLE_ID,
+                )
+
+                verify_result = request_llm_verification(
+                    server_url=Config.LLM_VERIFY_SERVER_URL or Config.SERVER_URL,
+                    ota_log=verification_log,
+                    timeout=Config.LLM_VERIFY_TIMEOUT,
+                )
+
+                if verify_result["decision"] == "REJECT":
+                    logger.warning(
+                        f"LLM verification REJECTED: {verify_result['reason']}"
+                    )
+                    self._report_status(
+                        'failed', version,
+                        f"LLM REJECT: {verify_result['reason'][:200]}"
+                    )
+                    # 업데이트 이력에 REJECT 기록
+                    OTALogCollector.save_update_history_entry(
+                        from_version=start_version,
+                        to_version=version,
+                        result="REJECTED_BY_LLM",
+                    )
+                    self._send_failure_log(
+                        phase=OTAPhase.VERIFY,
+                        target_version=version,
+                        error_code="LLM_REJECT",
+                        error_message=verify_result['reason'][:500],
+                        current_version=start_version,
+                        ota_log=[
+                            "DOWNLOAD OK",
+                            "VERIFY OK",
+                            "INSTALL OK",
+                            f"LLM_VERIFY REJECT: {verify_result['reason'][:200]}",
+                        ],
+                    )
+                    # 정리
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                    return False
+
+                logger.info("LLM verification APPROVED")
+            # ── LLM 2차 검증 끝 ──────────────────────────────────
+
             # 완료
             self._report_status('completed', version)
             logger.info(f"Update completed: {version}")
+
+            # 업데이트 이력 저장
+            OTALogCollector.save_update_history_entry(
+                from_version=start_version,
+                to_version=version,
+                result="SUCCESS",
+            )
+
             self._send_success_log(
                 phase=OTAPhase.INSTALL,
                 target_version=version,
@@ -555,18 +643,19 @@ class OTAClient:
                     "DOWNLOAD OK",
                     "VERIFY OK",
                     "INSTALL OK",
+                    "LLM_VERIFY APPROVE" if Config.LLM_VERIFY_ENABLED else "LLM_VERIFY SKIPPED",
                     "REPORT OK",
                 ],
             )
-            
+
             # 정리
             try:
                 os.remove(filepath)
             except Exception as e:
                 logger.warning(f"Cleanup failed: {e}")
-            
+
             return True
-            
+
         except Exception as e:
             logger.error(f"Update failed: {e}")
             self._report_status('failed', version, str(e))
@@ -629,12 +718,19 @@ class OTAClient:
         try:
             data = json.loads(msg.payload.decode('utf-8'))
             logger.info(f"MQTT command: {data.get('command')}")
-            
+
+            # LLM 검증용 MQTT 명령 이력 기록
+            if self.log_collector:
+                self.log_collector.record_mqtt_command(
+                    topic=msg.topic,
+                    payload_summary=data.get('command', str(data)[:100]),
+                )
+
             if data.get('command') == 'update':
                 firmware_info = data.get('firmware')
                 if firmware_info:
                     self.perform_update(firmware_info)
-                    
+
         except Exception as e:
             logger.error(f"MQTT message error: {e}")
     
