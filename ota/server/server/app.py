@@ -12,10 +12,10 @@ import threading
 import subprocess
 import tempfile
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
-from flask import Flask, request, jsonify, redirect    # request: 클라이언트의 HTTP 요청 전체 
+from flask import Flask, has_request_context, jsonify, redirect, request, send_from_directory
 from flask_cors import CORS
 from packaging import version
 from sqlalchemy.exc import IntegrityError
@@ -302,13 +302,36 @@ def _get_oci_object_ref(filename: str) -> str:
     return f"oci://{Config.OCI_BUCKET}/{prefix}/{filename}"
 
 
+def _local_firmware_path(filename: str) -> str:
+    safe_name = secure_filename(filename or "")
+    if not safe_name:
+        return ""
+    return os.path.join(Config.FIRMWARE_DIR, safe_name)
+
+
+def _build_local_firmware_url(filename: str) -> str:
+    base_url = str(Config.FIRMWARE_BASE_URL or "").strip().rstrip("/")
+    if not base_url and has_request_context():
+        base_url = request.url_root.rstrip("/")
+    if not base_url:
+        return ""
+    return f"{base_url}/firmware/{quote(str(filename or ''))}"
+
+
 def build_firmware_url(filename: str) -> str:
-    """외부 장치가 접근 가능한 OCI 펌웨어 URL 생성."""
+    """외부 장치가 접근 가능한 펌웨어 URL(OCI 우선, 로컬 fallback) 생성."""
     firmware = Firmware.query.filter_by(filename=filename).first()
-    if firmware and firmware.oci_uploaded:
+    if not firmware:
+        return ""
+
+    if firmware.oci_uploaded:
         oci_url = _get_oci_object_url(filename)
         if oci_url:
             return oci_url
+
+    local_path = _local_firmware_path(filename)
+    if local_path and os.path.isfile(local_path):
+        return _build_local_firmware_url(filename)
     return ""
 
 
@@ -613,9 +636,9 @@ def _build_trigger_firmware_info(vehicle_id: str, firmware: Firmware):
     if not firmware_url:
         return None, (
             jsonify({
-                'error': 'Firmware is not available in OCI',
+                'error': 'Firmware is not available for distribution',
                 'target_version': firmware.version,
-                'hint': 'Upload the bundle to OCI successfully before triggering updates.',
+                'hint': 'Check firmware upload result and OTA_GH_FIRMWARE_BASE_URL/OCI settings.',
             }),
             409,
         )
@@ -871,13 +894,13 @@ def update_check():
             firmware_url = build_firmware_url(latest_firmware.filename)
             if not firmware_url:
                 logger.warning(
-                    "Update available for %s but firmware is not distributable via OCI: version=%s",
+                    "Update available for %s but firmware is not distributable: version=%s",
                     vehicle_id,
                     latest_firmware.version,
                 )
                 return jsonify({
                     'update_available': False,
-                    'message': 'Active firmware is not available in OCI yet'
+                    'message': 'Active firmware is not downloadable yet'
                 })
             
             response = {
@@ -1068,6 +1091,23 @@ def _upload_stream_to_oci(stream, filename: str) -> bool:
         return False
 
 
+def _save_stream_to_local(stream, filename: str) -> str:
+    """업로드 스트림을 로컬 펌웨어 디렉토리에 저장."""
+    target_path = _local_firmware_path(filename)
+    if not target_path:
+        raise ValueError("Invalid local firmware filename")
+    os.makedirs(Config.FIRMWARE_DIR, exist_ok=True)
+    stream.seek(0)
+    with open(target_path, "wb") as out_file:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            out_file.write(chunk)
+    stream.seek(0)
+    return target_path
+
+
 def _announce_new_release(firmware: Firmware):
     """새 릴리즈 업로드 후 차량 announce 토픽으로 브로드캐스트."""
     if not firmware:
@@ -1075,7 +1115,7 @@ def _announce_new_release(firmware: Firmware):
     firmware_url = build_firmware_url(firmware.filename)
     if not firmware_url:
         logger.warning(
-            "Skipping release announce: firmware not available in OCI (version=%s)",
+            "Skipping release announce: firmware URL unavailable (version=%s)",
             firmware.version,
         )
         return
@@ -1102,15 +1142,24 @@ def _announce_new_release(firmware: Firmware):
 def download_firmware(filename):
     """
     펌웨어 파일 다운로드
-    OCI URL로만 리다이렉트한다.
+    OCI URL 리다이렉트 또는 로컬 파일 다운로드를 제공한다.
     """
     try:
         firmware = Firmware.query.filter_by(filename=filename).first_or_404()
         if firmware.oci_uploaded:
-            oci_url = _get_oci_object_url(filename)
+            oci_url = _get_oci_object_url(firmware.filename)
             if oci_url:
                 return redirect(oci_url)
-        return jsonify({'error': 'Firmware is not available in OCI'}), 404
+
+        local_path = _local_firmware_path(firmware.filename)
+        if local_path and os.path.isfile(local_path):
+            return send_from_directory(
+                Config.FIRMWARE_DIR,
+                firmware.filename,
+                as_attachment=True,
+                download_name=firmware.filename,
+            )
+        return jsonify({'error': 'Firmware file not found'}), 404
     
     except Exception as e:
         logger.error(f"Error serving firmware: {e}", exc_info=True)
@@ -1169,11 +1218,18 @@ def upload_firmware():
         file.stream.seek(0)
         sha256, file_size = _stream_file_stats(file.stream)
         oci_uploaded = _upload_stream_to_oci(file.stream, filename)
-        if not oci_uploaded:
-            return jsonify({
-                'error': 'Failed to upload firmware to OCI'
-            }), 502
-        object_ref = _get_oci_object_ref(filename)
+        if oci_uploaded:
+            object_ref = _get_oci_object_ref(filename)
+        else:
+            try:
+                object_ref = _save_stream_to_local(file.stream, filename)
+                logger.info("Stored firmware locally: %s", object_ref)
+            except Exception as ex:
+                logger.error("Failed to store firmware locally: %s", ex, exc_info=True)
+                return jsonify({
+                    'error': 'Failed to store firmware',
+                    'detail': str(ex),
+                }), 500
         
         # DB 반영 (신규 등록 또는 기존 버전 갱신)
         if existing_firmware:
@@ -1183,7 +1239,7 @@ def upload_firmware():
             existing_firmware.sha256 = sha256
             existing_firmware.release_notes = release_notes
             existing_firmware.is_active = True
-            existing_firmware.oci_uploaded = True
+            existing_firmware.oci_uploaded = oci_uploaded
             firmware = existing_firmware
             status_code = 200
             logger.info(f"Firmware replaced: {version_str} ({filename})")
@@ -1196,7 +1252,7 @@ def upload_firmware():
                 sha256=sha256,
                 release_notes=release_notes,
                 is_active=True,
-                oci_uploaded=True,
+                oci_uploaded=oci_uploaded,
             )
             db.session.add(firmware)
             status_code = 201

@@ -21,7 +21,7 @@ const API_BASE_URL =
 
 const MONITORING_API_BASE_URL =
   import.meta.env.VITE_VLM_API_URL ||
-  `${window.location.protocol}//${window.location.hostname}:4000`;
+  '';
 
 const REFRESH_INTERVAL = 5000;
 const DEFAULT_ONLINE_WINDOW_SEC = 300;
@@ -87,6 +87,11 @@ const OTADashboard = () => {
   };
 
   const fetchMonitoringData = async () => {
+    if (!MONITORING_API_BASE_URL) {
+      setMonitoringError('');
+      setMonitoringLoading(false);
+      return;
+    }
     try {
       const cityQuery = monitoringCity ? `?city=${encodeURIComponent(monitoringCity)}` : '';
       const labels = ['summary', 'rootCause', 'cities', 'timeBucket', 'models', 'network'];
