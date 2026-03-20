@@ -3,3 +3,4 @@
 ota/server/release.env
 .env
 out/
+*.bak
