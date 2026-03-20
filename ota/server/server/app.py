@@ -1117,12 +1117,14 @@ def _upload_stream_to_oci(stream, filename: str) -> bool:
         return False
 
 
-def _save_stream_to_local(stream, filename: str) -> str:
-    """업로드 스트림을 로컬 펌웨어 디렉토리에 저장."""
+def _save_stream_to_local(stream, filename: str) -> tuple[str, str, int]:
+    """업로드 스트림을 로컬 펌웨어 디렉토리에 저장하면서 SHA256과 크기를 계산."""
     target_path = _local_firmware_path(filename)
     if not target_path:
         raise ValueError("Invalid local firmware filename")
     os.makedirs(Config.FIRMWARE_DIR, exist_ok=True)
+    hasher = hashlib.sha256()
+    total_size = 0
     stream.seek(0)
     with open(target_path, "wb") as out_file:
         while True:
@@ -1130,8 +1132,10 @@ def _save_stream_to_local(stream, filename: str) -> str:
             if not chunk:
                 break
             out_file.write(chunk)
+            hasher.update(chunk)
+            total_size += len(chunk)
     stream.seek(0)
-    return target_path
+    return target_path, hasher.hexdigest(), total_size
 
 
 def _announce_new_release(firmware: Firmware):
@@ -1311,14 +1315,14 @@ def upload_firmware():
                 'firmware': existing_firmware.to_dict()
             }), 409
 
-        file.stream.seek(0)
-        sha256, file_size = _stream_file_stats(file.stream)
+        started_at = time.monotonic()
         oci_uploaded = _upload_stream_to_oci(file.stream, filename)
         if oci_uploaded:
+            sha256, file_size = _stream_file_stats(file.stream)
             object_ref = _get_oci_object_ref(filename)
         else:
             try:
-                object_ref = _save_stream_to_local(file.stream, filename)
+                object_ref, sha256, file_size = _save_stream_to_local(file.stream, filename)
                 logger.info("Stored firmware locally: %s", object_ref)
             except Exception as ex:
                 logger.error("Failed to store firmware locally: %s", ex, exc_info=True)
@@ -1365,6 +1369,16 @@ def upload_firmware():
         )
 
         db.session.commit()
+
+        total_sec = time.monotonic() - started_at
+        logger.info(
+            "Firmware upload timing: version=%s file=%s size_mib=%.1f total_sec=%.2f oci=%s",
+            version_str,
+            filename,
+            file_size / (1024.0 * 1024.0),
+            total_sec,
+            oci_uploaded,
+        )
 
         _announce_new_release(firmware)
 

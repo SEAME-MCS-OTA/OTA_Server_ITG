@@ -37,6 +37,8 @@ const OTADashboard = () => {
   const [uploadVersion, setUploadVersion] = useState('');
   const [uploadNotes, setUploadNotes] = useState('');
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadPhase, setUploadPhase] = useState('idle');
   const [loading, setLoading] = useState(true);
 
   const [monitoringSummary, setMonitoringSummary] = useState(null);
@@ -140,10 +142,15 @@ const OTADashboard = () => {
   };
 
   useEffect(() => {
-    fetchAllData();
-    const interval = setInterval(fetchAllData, REFRESH_INTERVAL);
+    const tick = () => {
+      if (!uploading) {
+        fetchAllData();
+      }
+    };
+    tick();
+    const interval = setInterval(tick, REFRESH_INTERVAL);
     return () => clearInterval(interval);
-  }, [monitoringCity]);
+  }, [monitoringCity, uploading]);
 
   const getStatusColor = (status) => {
     const colors = {
@@ -285,20 +292,50 @@ const OTADashboard = () => {
 
     try {
       setUploading(true);
+      setUploadProgress(0);
+      setUploadPhase('uploading');
       const form = new FormData();
       form.append('file', uploadFile);
       form.append('version', uploadVersion.trim());
       form.append('release_notes', uploadNotes || '');
       form.append('overwrite', 'true');
 
-      const res = await fetch(`${API_BASE_URL}/api/v1/admin/firmware`, {
-        method: 'POST',
-        body: form,
+      const body = await new Promise((resolve, reject) => {
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `${API_BASE_URL}/api/v1/admin/firmware`);
+
+        xhr.upload.onprogress = (event) => {
+          if (!event.lengthComputable || event.total <= 0) {
+            return;
+          }
+          const percent = Math.max(0, Math.min(99, Math.round((event.loaded / event.total) * 100)));
+          setUploadProgress(percent);
+        };
+
+        xhr.upload.onload = () => {
+          setUploadProgress(100);
+          setUploadPhase('processing');
+        };
+
+        xhr.onerror = () => reject(new Error('Network error during upload'));
+        xhr.onabort = () => reject(new Error('Upload aborted'));
+
+        xhr.onload = () => {
+          let parsed = {};
+          try {
+            parsed = JSON.parse(xhr.responseText || '{}');
+          } catch (_) {
+            parsed = {};
+          }
+          if (xhr.status >= 200 && xhr.status < 300) {
+            resolve(parsed);
+            return;
+          }
+          reject(new Error(parsed.error || `HTTP ${xhr.status}`));
+        };
+
+        xhr.send(form);
       });
-      const body = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        throw new Error(body.error || `HTTP ${res.status}`);
-      }
 
       alert(`Upload complete: v${body?.firmware?.version || uploadVersion.trim()}`);
       setUploadFile(null);
@@ -312,6 +349,8 @@ const OTADashboard = () => {
       alert(`Upload failed: ${err.message}`);
     } finally {
       setUploading(false);
+      setUploadProgress(0);
+      setUploadPhase('idle');
     }
   };
 
@@ -576,9 +615,29 @@ const OTADashboard = () => {
                         uploading ? 'bg-gray-300 text-gray-700' : 'bg-blue-600 text-white hover:bg-blue-700'
                       }`}
                     >
-                      {uploading ? 'Uploading...' : 'Upload + Activate'}
+                      {uploading
+                        ? (uploadPhase === 'processing' ? 'Processing on Server...' : `Uploading ${uploadProgress}%`)
+                        : 'Upload + Activate'}
                     </button>
                   </div>
+                  {uploading && (
+                    <div className="mt-3">
+                      <div className="flex items-center justify-between text-xs text-gray-600">
+                        <span>
+                          {uploadPhase === 'processing'
+                            ? 'Upload finished. Server is saving, hashing, and activating the firmware.'
+                            : 'Uploading firmware to OTA server'}
+                        </span>
+                        <span>{uploadPhase === 'processing' ? '100%' : `${uploadProgress}%`}</span>
+                      </div>
+                      <div className="mt-2 h-2 w-full rounded bg-gray-200 overflow-hidden">
+                        <div
+                          className={`h-full rounded ${uploadPhase === 'processing' ? 'bg-amber-500 animate-pulse' : 'bg-blue-600'}`}
+                          style={{ width: `${uploadPhase === 'processing' ? 100 : uploadProgress}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
                 </div>
                 <div className="divide-y divide-gray-200">
                   {firmware.length === 0 ? (
