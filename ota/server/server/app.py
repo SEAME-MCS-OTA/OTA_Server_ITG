@@ -48,6 +48,7 @@ _mqtt_last_retry_at = 0.0
 _MQTT_RETRY_INTERVAL_SEC = 5.0
 _local_probe_last_at = 0.0
 _local_probe_lock = threading.Lock()
+_llm_enabled = Config.LLM_VERIFICATION_ENABLED
 
 
 def _parse_local_device_map(raw: str):
@@ -517,6 +518,7 @@ def _pick_latest_active_firmware():
         preferred = active_query.filter(Firmware.filename.ilike('%.raucb')).order_by(Firmware.created_at.desc()).first()
         if preferred:
             return preferred
+        return None
     return active_query.order_by(Firmware.created_at.desc()).first()
 
 
@@ -562,10 +564,24 @@ def _resolve_target_firmware(target_version: str | None):
                 }),
                 404,
             )
+        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
+            return None, (
+                jsonify({
+                    'error': 'Only .raucb firmware bundles are supported',
+                    'target_version': firmware.version,
+                    'filename': firmware.filename,
+                }),
+                409,
+            )
         return firmware, None
 
     firmware = _pick_latest_active_firmware()
     if not firmware:
+        if Config.PREFER_RAUCB_FIRMWARE:
+            return None, (
+                jsonify({'error': 'No active .raucb firmware found'}),
+                404,
+            )
         return None, (jsonify({'error': 'No active firmware found'}), 404)
     return firmware, None
 
@@ -632,6 +648,16 @@ def _validate_trigger_vehicle(vehicle_id: str, firmware: Firmware, force_trigger
 
 
 def _build_trigger_firmware_info(vehicle_id: str, firmware: Firmware):
+    if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
+        return None, (
+            jsonify({
+                'error': 'Only .raucb firmware bundles are supported',
+                'target_version': firmware.version,
+                'filename': firmware.filename,
+            }),
+            409,
+        )
+
     firmware_url = build_firmware_url(firmware.filename)
     if not firmware_url:
         return None, (
@@ -1166,6 +1192,71 @@ def download_firmware(filename):
         return jsonify({'error': 'Internal server error'}), 500
 
 
+@app.route('/api/ota/verify', methods=['POST'])
+def verify_ota_update():
+    """
+    OTA 업데이트 2차 검증 엔드포인트.
+    실서버에서는 LLM 검증이 비활성화된 경우 RAUC 무결성 검증 결과를 그대로 승인한다.
+    """
+    try:
+        ota_log = request.get_json()
+        if not ota_log:
+            return jsonify({"error": "No JSON body provided"}), 400
+
+        required_fields = ["firmware_metadata", "process_log", "device_state"]
+        for field in required_fields:
+            if field not in ota_log:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        if _llm_enabled:
+            try:
+                from llm_verifier import (
+                    call_llm_verification,
+                    preprocess_log,
+                    save_verification_result,
+                )
+            except Exception as import_ex:
+                logger.error("LLM verifier unavailable: %s", import_ex, exc_info=True)
+                return jsonify({
+                    "decision": "REJECT",
+                    "reason": f"LLM verifier unavailable: {import_ex}. Fail-safe REJECT.",
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                }), 500
+
+            preprocessed = preprocess_log(ota_log)
+            result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
+            try:
+                save_verification_result(ota_log, result)
+            except Exception as save_ex:
+                logger.error("Failed to save LLM verification result: %s", save_ex, exc_info=True)
+        else:
+            result = {
+                "decision": "APPROVE",
+                "reason": "LLM verification disabled. Relying on RAUC integrity check only.",
+            }
+
+        logger.info(
+            "OTA verify: vehicle=%s decision=%s llm_enabled=%s",
+            ota_log.get("device_state", {}).get("vehicle_id", "unknown"),
+            result["decision"],
+            _llm_enabled,
+        )
+
+        return jsonify({
+            "decision": result["decision"],
+            "reason": result["reason"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        })
+
+    except Exception as e:
+        logger.error(f"Error in verify_ota_update: {e}", exc_info=True)
+        return jsonify({
+            "decision": "REJECT",
+            "reason": f"서버 내부 오류로 Fail-safe REJECT: {str(e)}",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+
+
 @app.route('/api/v1/admin/firmware', methods=['POST'])
 def upload_firmware():
     """
@@ -1203,6 +1294,11 @@ def upload_firmware():
         )
         if not filename:
             return jsonify({'error': 'Invalid upload filename'}), 400
+        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(filename):
+            return jsonify({
+                'error': 'Only .raucb firmware bundles are supported',
+                'filename': filename,
+            }), 400
 
         # 같은 버전이 이미 등록된 경우 기본적으로 거부
         existing_firmware = Firmware.query.filter_by(version=version_str).first()
@@ -1313,6 +1409,13 @@ def activate_firmware():
 
         if not firmware:
             return jsonify({'error': 'Firmware not found'}), 404
+        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
+            return jsonify({
+                'error': 'Only .raucb firmware bundles can be activated',
+                'id': firmware.id,
+                'version': firmware.version,
+                'filename': firmware.filename,
+            }), 409
 
         firmware.is_active = True
         db.session.flush()

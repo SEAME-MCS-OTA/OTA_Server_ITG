@@ -211,8 +211,115 @@ class MQTTHandler:
             return 300
 
     @staticmethod
+    def _in_progress_recovery_timeout_sec(status: str = "") -> int:
+        try:
+            online_window = max(30, int(Config.VEHICLE_ONLINE_WINDOW_SEC))
+        except Exception:
+            online_window = 300
+
+        status_norm = str(status or "").strip().lower()
+        if status_norm == "pending":
+            # A published trigger should transition quickly.
+            # If the device stays idle for over ~90 seconds, the command
+            # likely never started and retriggering should not be blocked.
+            return 90
+        return max(1800, online_window * 6)
+
+    @staticmethod
     def _is_in_progress_status(status: str) -> bool:
         return str(status or "").strip().lower() in {"pending", "downloading", "verifying", "installing"}
+
+    @staticmethod
+    def _extract_current_version(data: dict) -> str:
+        if not isinstance(data, dict):
+            return ""
+        for candidate in (
+            data.get("current_version"),
+            ((data.get("ota") or {}).get("current_version")),
+        ):
+            text = str(candidate or "").strip()
+            if text:
+                return text
+        return ""
+
+    @staticmethod
+    def _append_status_note(existing: str, note: str) -> str:
+        base = str(existing or "").strip()
+        extra = str(note or "").strip()
+        if not extra:
+            return base
+        if not base:
+            return extra
+        if extra in base:
+            return base
+        return f"{base} | {extra}"
+
+    def _latest_in_progress_history(self, vehicle_id: str) -> Optional[UpdateHistory]:
+        return (
+            UpdateHistory.query.filter_by(vehicle_id=vehicle_id)
+            .filter(UpdateHistory.status.in_(("pending", "downloading", "verifying", "installing")))
+            .order_by(UpdateHistory.updated_at.desc(), UpdateHistory.started_at.desc())
+            .first()
+        )
+
+    def _should_preserve_in_progress_status(
+        self,
+        vehicle_id: str,
+        prev_status: str,
+        incoming_status: str,
+        reported_version: str = "",
+    ) -> bool:
+        if incoming_status not in {"idle", "offline"}:
+            return False
+        if not self._is_in_progress_status(prev_status):
+            return False
+
+        history = self._latest_in_progress_history(vehicle_id)
+        if history is None:
+            logger.info(
+                "Allowing presence overwrite without active update history: vehicle_id=%s prev=%s new=%s",
+                vehicle_id,
+                prev_status,
+                incoming_status,
+            )
+            return False
+
+        now = datetime.utcnow()
+        last_activity = history.updated_at or history.started_at or now
+        age_sec = max(0.0, (now - last_activity).total_seconds())
+        recovery_timeout_sec = self._in_progress_recovery_timeout_sec(str(history.status or prev_status))
+        if age_sec <= recovery_timeout_sec:
+            logger.info(
+                "Ignoring in-progress presence overwrite: vehicle_id=%s prev=%s new=%s age=%.1fs timeout=%.1fs",
+                vehicle_id,
+                prev_status,
+                incoming_status,
+                age_sec,
+                recovery_timeout_sec,
+            )
+            return True
+
+        recovered_status = "failed"
+        target_version = str(history.target_version or "").strip()
+        if reported_version and target_version and target_version == reported_version:
+            recovered_status = "completed"
+            history.progress = 100
+
+        history.status = recovered_status
+        history.completed_at = now
+        history.message = self._append_status_note(
+            history.message,
+            f"Recovered stale in-progress state via presence={incoming_status} age={age_sec:.1f}s",
+        )
+        logger.warning(
+            "Recovered stale in-progress state: vehicle_id=%s prev=%s new=%s recovered=%s age=%.1fs",
+            vehicle_id,
+            prev_status,
+            incoming_status,
+            recovered_status,
+            age_sec,
+        )
+        return False
 
     def _handle_register_message(self, data: dict):
         """
@@ -251,14 +358,14 @@ class MQTTHandler:
 
                     vehicle = self._upsert_vehicle(vehicle_id, default_status=status)
                     prev_status = str(vehicle.status or "").strip().lower()
-                    if (status in {"idle", "offline"}) and self._is_in_progress_status(prev_status):
-                        # Keep in-progress state to avoid flicker by presence/register payloads.
-                        logger.info(
-                            "Ignoring register presence overwrite: vehicle_id=%s prev=%s new=%s",
-                            vehicle_id,
-                            prev_status,
-                            status,
-                        )
+                    if self._should_preserve_in_progress_status(
+                        vehicle_id,
+                        prev_status,
+                        status,
+                        current_version or str(vehicle.current_version or "").strip(),
+                    ):
+                        # Keep recent in-progress state to avoid flicker during live updates.
+                        pass
                     else:
                         vehicle.status = status
                     vehicle.last_seen = now
@@ -323,6 +430,7 @@ class MQTTHandler:
                     prev_version = vehicle.current_version
                     prev_status = str(vehicle.status or "").strip().lower()
                     ip_addr = self._extract_ip(data)
+                    reported_version = self._extract_current_version(data)
 
                     if is_presence and timestamp is not None:
                         age_sec = (now - timestamp).total_seconds()
@@ -339,14 +447,16 @@ class MQTTHandler:
                     vehicle.last_seen = now
                     if ip_addr:
                         vehicle.last_ip = ip_addr
+                    if reported_version:
+                        vehicle.current_version = reported_version
 
-                    if is_presence and (status in {'idle', 'offline'}) and self._is_in_progress_status(prev_status):
-                        logger.info(
-                            "Ignoring in-progress presence overwrite: vehicle_id=%s prev=%s new=%s",
-                            vehicle_id,
-                            prev_status,
-                            status,
-                        )
+                    if is_presence and self._should_preserve_in_progress_status(
+                        vehicle_id,
+                        prev_status,
+                        status,
+                        reported_version or str(vehicle.current_version or "").strip(),
+                    ):
+                        pass
                     else:
                         vehicle.status = status
 

@@ -99,8 +99,8 @@ class Config:
 
     # Local device probe fallback (MQTT heartbeat 보조 경로)
     # Format: "vehicle_id@ip:port,vehicle_id2@ip2:port2"
-    # Example: "vw-ivi-0026@192.168.86.250:8080"
-    LOCAL_DEVICE_MAP = os.getenv('LOCAL_DEVICE_MAP', 'vw-ivi-0026@192.168.86.250:8080').strip()
+    # Example: "vw-ivi-0026@192.168.86.23:8080"
+    LOCAL_DEVICE_MAP = os.getenv('LOCAL_DEVICE_MAP', 'vw-ivi-0026@192.168.86.23:8080').strip()
     LOCAL_PROBE_ENABLED = _env_bool('LOCAL_PROBE_ENABLED', False)
     LOCAL_PROBE_INTERVAL_SEC = int(os.getenv('LOCAL_PROBE_INTERVAL_SEC', '5'))
     LOCAL_PROBE_TIMEOUT_SEC = float(os.getenv('LOCAL_PROBE_TIMEOUT_SEC', '1.5'))
@@ -108,6 +108,10 @@ class Config:
         '1', 'true', 'yes', 'y', 'on'
     }
     MQTT_COMMAND_ONLY = _env_bool('MQTT_COMMAND_ONLY', True)
+
+    # LLM 2차 검증 설정
+    LLM_VERIFICATION_ENABLED = _env_bool('LLM_VERIFY', False)
+    LLM_MODEL = os.getenv('LLM_MODEL', 'claude-sonnet-4-20250514').strip()
     
     # 로깅 설정
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
