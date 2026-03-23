@@ -2,20 +2,22 @@
 OTA Server - Main Application
 Flask REST API 서버
 """
+import json
 import os
 import logging
 import hashlib
-import json
 import base64
+import sqlite3
 import time
+import mimetypes
 import threading
-import subprocess
 import tempfile
+import subprocess
 from datetime import datetime, timedelta
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 import requests
-from flask import Flask, has_request_context, jsonify, redirect, request, send_from_directory
+from flask import Flask, request, jsonify, send_file    # request: 클라이언트의 HTTP 요청 전체 
 from flask_cors import CORS
 from packaging import version
 from sqlalchemy.exc import IntegrityError
@@ -26,6 +28,12 @@ from config import Config
 from models import db, Vehicle, Firmware, UpdateHistory
 from mqtt_handler import MQTTHandler
 from monitoring_reporter import publish_update_result, should_report_final_status
+from llm_verifier import (
+    call_llm_verification,
+    get_llm_log_path,
+    preprocess_log,
+    save_verification_result,
+)
 
 # 로깅 설정
 logging.basicConfig(
@@ -48,7 +56,8 @@ _mqtt_last_retry_at = 0.0
 _MQTT_RETRY_INTERVAL_SEC = 5.0
 _local_probe_last_at = 0.0
 _local_probe_lock = threading.Lock()
-_llm_enabled = Config.LLM_VERIFICATION_ENABLED
+_runtime_init_lock = threading.Lock()
+_runtime_initialized = False
 
 
 def _parse_local_device_map(raw: str):
@@ -81,8 +90,43 @@ def _parse_local_device_map(raw: str):
 
 
 def _local_endpoint_for_vehicle(vehicle_id: str) -> str:
-    mapping = _parse_local_device_map(Config.LOCAL_DEVICE_MAP)
+    mapping = _parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', ''))
     return str(mapping.get(str(vehicle_id or "").strip(), "")).strip()
+
+
+def _local_probe_enabled() -> bool:
+    if not bool(getattr(Config, 'LOCAL_PROBE_ENABLED', False)):
+        return False
+    return bool(_parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', '')))
+
+
+def _client_ip_from_request() -> str:
+    forwarded = str(request.headers.get('X-Forwarded-For') or '').strip()
+    if forwarded:
+        return forwarded.split(',')[0].strip()
+    return str(request.remote_addr or '').strip()
+
+
+def _mark_vehicle_ip(vehicle: Vehicle, ip_value: str):
+    ip_text = str(ip_value or '').strip()
+    if ip_text:
+        vehicle.last_ip = ip_text
+
+
+def _vehicle_online_state(vehicle: Vehicle):
+    last_seen = vehicle.last_seen
+    if not last_seen:
+        return False, None
+    age_sec = max(0.0, (datetime.utcnow() - last_seen).total_seconds())
+    return age_sec <= float(Config.VEHICLE_ONLINE_WINDOW_SEC), age_sec
+
+
+def _serialize_vehicle(vehicle: Vehicle):
+    data = vehicle.to_dict()
+    online, age_sec = _vehicle_online_state(vehicle)
+    data['online'] = online
+    data['last_seen_age_sec'] = age_sec
+    return data
 
 
 def _phase_event_to_status(phase: str, event: str) -> str:
@@ -102,6 +146,8 @@ def _phase_event_to_status(phase: str, event: str) -> str:
 def _probe_local_devices_once(force: bool = False):
     """Probe configured local device endpoints and refresh Vehicle heartbeat."""
     global _local_probe_last_at
+    if not _local_probe_enabled():
+        return
     interval = max(1, int(Config.LOCAL_PROBE_INTERVAL_SEC))
     now_mono = time.monotonic()
     if (not force) and (now_mono - _local_probe_last_at) < interval:
@@ -113,7 +159,14 @@ def _probe_local_devices_once(force: bool = False):
             return
         _local_probe_last_at = now_mono
 
-        mapping = _parse_local_device_map(Config.LOCAL_DEVICE_MAP)
+        mapping = _parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', ''))
+        learned = {}
+        for vehicle in Vehicle.query.filter(Vehicle.last_ip.isnot(None)).all():
+            vehicle_id = str(vehicle.vehicle_id or '').strip()
+            vehicle_ip = str(vehicle.last_ip or '').strip()
+            if vehicle_id and vehicle_ip and vehicle_id not in mapping:
+                learned[vehicle_id] = f"http://{vehicle_ip}:8080"
+        mapping.update(learned)
         if not mapping:
             return
 
@@ -143,7 +196,6 @@ def _probe_local_devices_once(force: bool = False):
             try:
                 device_id = str(status_data.get("device_id") or mapped_vehicle_id).strip()
                 current_version = str(status_data.get("current_version") or "").strip()
-                ip_addr = str(status_data.get("ip") or status_data.get("ip_address") or "").strip()
                 phase = str(status_data.get("phase") or "").strip()
                 event = str(status_data.get("event") or "").strip()
                 status = _phase_event_to_status(phase, event)
@@ -155,10 +207,10 @@ def _probe_local_devices_once(force: bool = False):
 
                 if current_version:
                     vehicle.current_version = current_version
-                if ip_addr:
-                    vehicle.last_ip = ip_addr
                 vehicle.status = status or "idle"
                 vehicle.last_seen = datetime.utcnow()
+                parsed = urlparse(base_url)
+                _mark_vehicle_ip(vehicle, parsed.hostname or '')
 
                 db.session.commit()
             except Exception as ex:
@@ -184,29 +236,33 @@ def ensure_schema_compatibility():
     table_names = set(inspector.get_table_names())
 
     with db.engine.begin() as conn:
-        if 'update_history' in table_names:
-            update_history_columns = {
-                column['name'] for column in inspector.get_columns('update_history')
-            }
-            if 'update_type' not in update_history_columns:
-                conn.execute(text("ALTER TABLE update_history ADD COLUMN update_type VARCHAR(20)"))
-                logger.info("Added missing column: update_history.update_type")
-
-        if 'firmware' in table_names:
-            firmware_columns = {
-                column['name'] for column in inspector.get_columns('firmware')
-            }
-            if 'oci_uploaded' not in firmware_columns:
-                conn.execute(text("ALTER TABLE firmware ADD COLUMN oci_uploaded BOOLEAN DEFAULT FALSE"))
-                logger.info("Added missing column: firmware.oci_uploaded")
-
         if 'vehicles' in table_names:
-            vehicles_columns = {
+            vehicle_columns = {
                 column['name'] for column in inspector.get_columns('vehicles')
             }
-            if 'last_ip' not in vehicles_columns:
+            if 'last_ip' not in vehicle_columns:
                 conn.execute(text("ALTER TABLE vehicles ADD COLUMN last_ip VARCHAR(64)"))
                 logger.info("Added missing column: vehicles.last_ip")
+
+        if 'update_history' not in table_names:
+            return
+
+        update_history_columns = {
+            column['name'] for column in inspector.get_columns('update_history')
+        }
+
+        if 'update_type' not in update_history_columns:
+            conn.execute(text("ALTER TABLE update_history ADD COLUMN update_type VARCHAR(20)"))
+            logger.info("Added missing column: update_history.update_type")
+        if 'client_log_json' not in update_history_columns:
+            conn.execute(text("ALTER TABLE update_history ADD COLUMN client_log_json TEXT"))
+            logger.info("Added missing column: update_history.client_log_json")
+        if 'client_log_path' not in update_history_columns:
+            conn.execute(text("ALTER TABLE update_history ADD COLUMN client_log_path VARCHAR(1024)"))
+            logger.info("Added missing column: update_history.client_log_path")
+        if 'client_log_updated_at' not in update_history_columns:
+            conn.execute(text("ALTER TABLE update_history ADD COLUMN client_log_updated_at TIMESTAMP"))
+            logger.info("Added missing column: update_history.client_log_updated_at")
 
 def init_mqtt():
     """MQTT 핸들러 초기화"""
@@ -227,12 +283,32 @@ def init_mqtt():
         logger.error(f"Failed to initialize MQTT handler: {e}")
         logger.warning("Server will run without MQTT support")
 
+
+def initialize_server_runtime():
+    """Initialize runtime state once for both WSGI and dev-server entrypoints."""
+    global _runtime_initialized
+    if _runtime_initialized:
+        return
+    with _runtime_init_lock:
+        if _runtime_initialized:
+            return
+        Config.validate()
+        init_db()
+        with app.app_context():
+            _normalize_active_firmware()
+        if _local_probe_enabled():
+            _probe_local_devices_once(force=True)
+        init_mqtt()
+        _runtime_initialized = True
+        logger.info("Server runtime initialized")
+
 @app.before_request
 def before_request():
     """첫 요청 시 MQTT 초기화"""
     global mqtt_handler
     global _mqtt_last_retry_at
-    if Config.LOCAL_PROBE_ENABLED:
+    initialize_server_runtime()
+    if _local_probe_enabled():
         _probe_local_devices_once(force=False)
     need_init = mqtt_handler is None or not mqtt_handler.is_connected()
     retry_due = (time.monotonic() - _mqtt_last_retry_at) >= _MQTT_RETRY_INTERVAL_SEC
@@ -269,6 +345,36 @@ def compare_versions(v1: str, v2: str) -> int:
             return 0
 
 
+def normalize_completed_status_by_version(
+    status: str,
+    prev_version: str,
+    target_version: str,
+    message: str = "",
+) -> tuple[str, str]:
+    """
+    서버 성공 판정 보정:
+    - completed 수신 시, 이전 버전과 target_version이 동일하면 실패로 강등한다.
+    - 비교 기준값이 없는 경우(prev_version empty)는 기존 completed를 유지한다.
+    """
+    status_norm = str(status or "").strip().lower()
+    if status_norm != "completed":
+        return status_norm, str(message or "")
+
+    prev = str(prev_version or "").strip()
+    target = str(target_version or "").strip()
+    msg = str(message or "")
+
+    if not target:
+        reason = "target_version missing"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    if prev and prev == target:
+        reason = f"version unchanged: {prev}"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    return "completed", msg
+
+
 def parse_bool(value, default: bool = False) -> bool:
     """문자열/폼 값을 불리언으로 변환"""
     if value is None:
@@ -276,64 +382,196 @@ def parse_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
-def _get_oci_object_url(filename: str) -> str:
-    """OCI Object Storage object URL 조합 (PAR 토큰 기반). 토큰 미설정 시 빈 문자열 반환."""
-    token = (Config.OCI_PAR_TOKEN or '').strip()
-    if not token:
-        return ''
-    # Keep a user-provided leading slash (e.g. "/releases") because
-    # some PAR scopes are configured with object names that start with "/".
-    prefix = (Config.OCI_FIRMWARE_PREFIX or 'firmware').rstrip('/')
-    if not prefix:
-        prefix = 'firmware'
-    return (
-        f"https://objectstorage.{Config.OCI_REGION}.oraclecloud.com"
-        f"/p/{token}"
-        f"/n/{Config.OCI_NAMESPACE}"
-        f"/b/{Config.OCI_BUCKET}"
-        f"/o/{prefix}/{filename}"
+def build_firmware_url(filename: str) -> str:
+    """외부 장치가 접근 가능한 펌웨어 URL 생성"""
+    if Config.FIRMWARE_BASE_URL:
+        return f"{Config.FIRMWARE_BASE_URL}/firmware/{filename}"
+    return f"{request.url_root.rstrip('/')}/firmware/{filename}"
+
+
+def _command_payload_bytes(
+    ota_id: str,
+    url: str,
+    target_version: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> bytes:
+    body = {
+        "ota_id": str(ota_id or "").strip(),
+        "url": str(url or "").strip(),
+        "target_version": str(target_version or "").strip(),
+        "expected_sha256": str(expected_sha256 or "").strip().lower(),
+        "expected_size": int(expected_size or 0),
+    }
+    return json.dumps(
+        body,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def _sign_command_payload(
+    ota_id: str,
+    url: str,
+    target_version: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> tuple[dict | None, str | None]:
+    if not Config.COMMAND_SIGNING_ENABLED:
+        return None, None
+
+    key_path = str(Config.COMMAND_SIGNING_PRIVATE_KEY_PATH or "").strip()
+    if not key_path:
+        logger.info("Command signing skipped: COMMAND_SIGNING_PRIVATE_KEY_PATH is empty")
+        return None, None
+    if not os.path.exists(key_path):
+        logger.warning("Command signing skipped: private key missing at %s", key_path)
+        return None, f"private key missing: {key_path}"
+
+    payload = _command_payload_bytes(
+        ota_id=ota_id,
+        url=url,
+        target_version=target_version,
+        expected_sha256=expected_sha256,
+        expected_size=expected_size,
     )
 
+    msg_fd = -1
+    sig_fd = -1
+    msg_path = ""
+    sig_path = ""
+    try:
+        msg_fd, msg_path = tempfile.mkstemp(prefix="ota-cmd-", suffix=".msg")
+        sig_fd, sig_path = tempfile.mkstemp(prefix="ota-cmd-", suffix=".sig")
+        os.write(msg_fd, payload)
+        os.close(msg_fd)
+        msg_fd = -1
+        os.close(sig_fd)
+        sig_fd = -1
 
-def _get_oci_object_ref(filename: str) -> str:
-    """DB 저장용 OCI object reference."""
-    prefix = (Config.OCI_FIRMWARE_PREFIX or 'firmware').rstrip('/')
-    if not prefix:
-        prefix = 'firmware'
-    return f"oci://{Config.OCI_BUCKET}/{prefix}/{filename}"
+        proc = subprocess.run(
+            [
+                "openssl",
+                "pkeyutl",
+                "-sign",
+                "-inkey",
+                key_path,
+                "-rawin",
+                "-in",
+                msg_path,
+                "-out",
+                sig_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
+            return None, detail or f"openssl rc={proc.returncode}"
+
+        with open(sig_path, "rb") as fh:
+            sig_bytes = fh.read()
+        return {
+            "algorithm": "ed25519",
+            "key_id": Config.COMMAND_SIGNING_KEY_ID,
+            "value": base64.b64encode(sig_bytes).decode("ascii"),
+        }, None
+    except Exception as ex:
+        return None, f"{ex.__class__.__name__}: {ex}"
+    finally:
+        if msg_fd >= 0:
+            try:
+                os.close(msg_fd)
+            except Exception:
+                pass
+        if sig_fd >= 0:
+            try:
+                os.close(sig_fd)
+            except Exception:
+                pass
+        for path in (msg_path, sig_path):
+            if path and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
 
 
-def _local_firmware_path(filename: str) -> str:
-    safe_name = secure_filename(filename or "")
-    if not safe_name:
-        return ""
-    return os.path.join(Config.FIRMWARE_DIR, safe_name)
+def _firmware_delete_candidates(file_path: str, filename: str):
+    candidates = []
+    seen = set()
+
+    def add_candidate(path: str):
+        raw = str(path or "").strip()
+        if not raw:
+            return
+        resolved = os.path.realpath(raw)
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        candidates.append(resolved)
+
+    add_candidate(file_path)
+    if filename:
+        add_candidate(os.path.join(Config.FIRMWARE_DIR, filename))
+        add_candidate(os.path.join(Config.FIRMWARE_DIR, os.path.basename(filename)))
+    if file_path:
+        add_candidate(os.path.join(Config.FIRMWARE_DIR, os.path.basename(file_path)))
+
+    return candidates
 
 
-def _build_local_firmware_url(filename: str) -> str:
-    base_url = str(Config.FIRMWARE_BASE_URL or "").strip().rstrip("/")
-    if not base_url and has_request_context():
-        base_url = request.url_root.rstrip("/")
-    if not base_url:
-        return ""
-    return f"{base_url}/firmware/{quote(str(filename or ''))}"
+def _delete_firmware_artifacts(file_path: str, filename: str):
+    firmware_dir = os.path.realpath(Config.FIRMWARE_DIR)
+    removed_paths = []
+    missing_paths = []
+    errors = []
+
+    for candidate in _firmware_delete_candidates(file_path, filename):
+        if os.path.commonpath([firmware_dir, candidate]) != firmware_dir:
+            errors.append(f"Refusing to delete path outside firmware dir: {candidate}")
+            continue
+        if not os.path.exists(candidate):
+            missing_paths.append(candidate)
+            continue
+        try:
+            os.remove(candidate)
+            removed_paths.append(candidate)
+        except Exception as exc:
+            errors.append(f"{candidate}: {exc}")
+
+    return {
+        'removed_paths': removed_paths,
+        'missing_paths': missing_paths,
+        'errors': errors,
+    }
 
 
-def build_firmware_url(filename: str) -> str:
-    """외부 장치가 접근 가능한 펌웨어 URL(OCI 우선, 로컬 fallback) 생성."""
-    firmware = Firmware.query.filter_by(filename=filename).first()
-    if not firmware:
-        return ""
+def _safe_path_fragment(value: str) -> str:
+    text_value = secure_filename(str(value or '').strip())
+    return text_value or 'unknown'
 
-    if firmware.oci_uploaded:
-        oci_url = _get_oci_object_url(filename)
-        if oci_url:
-            return oci_url
 
-    local_path = _local_firmware_path(filename)
-    if local_path and os.path.isfile(local_path):
-        return _build_local_firmware_url(filename)
-    return ""
+def _persist_client_log_snapshot(vehicle_id: str, target_version: str, payload: dict, captured_at: datetime):
+    vehicle_dir = os.path.join(Config.CLIENT_LOG_DIR, _safe_path_fragment(vehicle_id))
+    os.makedirs(vehicle_dir, exist_ok=True)
+
+    timestamp = captured_at.strftime('%Y%m%d-%H%M%S')
+    filename = (
+        f"{timestamp}--"
+        f"{_safe_path_fragment(target_version)}.json"
+    )
+    file_path = os.path.join(vehicle_dir, filename)
+    tmp_path = f"{file_path}.tmp"
+
+    with open(tmp_path, 'w', encoding='utf-8') as fp:
+        json.dump(payload, fp, ensure_ascii=False, indent=2)
+        fp.write('\n')
+    os.replace(tmp_path, file_path)
+
+    return file_path
 
 
 def _url_points_to_localhost(url: str) -> bool:
@@ -362,142 +600,20 @@ def _build_ota_id(vehicle_id: str) -> str:
     return f"ota-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{safe_id}"
 
 
-def _build_upload_filename(original_name: str, version_str: str, custom_name: str = "") -> str:
-    custom_name = secure_filename(custom_name or "")
-    if custom_name:
-        return custom_name
-
-    safe_original_name = secure_filename(original_name or "")
-    if not safe_original_name:
-        return ""
-
-    if safe_original_name.lower().endswith('.tar.gz'):
-        ext = '.tar.gz'
-    else:
-        _, ext = os.path.splitext(safe_original_name)
-        ext = ext.lower()
-    if ext in {'', '.'}:
-        ext = '.tar.gz'
-    return f"app_{version_str}{ext}"
-
-
-def _canonical_command_payload(
-    ota_id: str,
-    url: str,
-    target_version: str,
-    expected_sha256: str,
-    expected_size: int,
-) -> bytes:
-    body = {
-        "ota_id": str(ota_id or "").strip(),
-        "url": str(url or "").strip(),
-        "target_version": str(target_version or "").strip(),
-        "expected_sha256": str(expected_sha256 or "").strip().lower(),
-        "expected_size": int(expected_size or 0),
-    }
-    return json.dumps(
-        body,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
-def _sign_command_payload(payload: bytes):
-    if not Config.COMMAND_SIGN_ENABLED:
-        return None, None
-
-    algo = str(Config.COMMAND_SIGN_ALGO or "").strip().lower()
-    if algo != "ed25519":
-        return None, f"Unsupported command signing algorithm: {algo or 'empty'}"
-
-    key_path = str(Config.COMMAND_SIGN_KEY_PATH or "").strip()
-    if not key_path:
-        return None, "COMMAND_SIGN_KEY_PATH is empty"
-    if not os.path.exists(key_path):
-        return None, f"Signing key not found: {key_path}"
-
-    msg_fd = -1
-    sig_fd = -1
-    msg_path = ""
-    sig_path = ""
-    try:
-        msg_fd, msg_path = tempfile.mkstemp(prefix="ota-cmd-", suffix=".msg")
-        sig_fd, sig_path = tempfile.mkstemp(prefix="ota-cmd-", suffix=".sig")
-        os.close(msg_fd)
-        os.close(sig_fd)
-        msg_fd = -1
-        sig_fd = -1
-
-        with open(msg_path, "wb") as f:
-            f.write(payload)
-
-        proc = subprocess.run(
-            [
-                "openssl",
-                "pkeyutl",
-                "-sign",
-                "-rawin",
-                "-inkey",
-                key_path,
-                "-in",
-                msg_path,
-                "-out",
-                sig_path,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
-            return None, f"OpenSSL signing failed: {detail or f'rc={proc.returncode}'}"
-
-        with open(sig_path, "rb") as f:
-            sig_b64 = base64.b64encode(f.read()).decode("ascii")
-
-        return {
-            "algorithm": "ed25519",
-            "key_id": str(Config.COMMAND_SIGN_KEY_ID or "ota-ed25519-v1"),
-            "value": sig_b64,
-        }, None
-    except Exception as ex:
-        return None, f"Command signing error: {ex.__class__.__name__}: {ex}"
-    finally:
-        if msg_fd >= 0:
-            try:
-                os.close(msg_fd)
-            except Exception:
-                pass
-        if sig_fd >= 0:
-            try:
-                os.close(sig_fd)
-            except Exception:
-                pass
-        for p in (msg_path, sig_path):
-            if p and os.path.exists(p):
-                try:
-                    os.remove(p)
-                except Exception:
-                    pass
-
-
-def _trigger_device_http(vehicle_id: str, firmware_info: dict):
+def _trigger_device_http(vehicle_id: str, ota_id: str, firmware_info: dict):
     """Fallback path: send OTA command directly to device HTTP API."""
     endpoint = _local_endpoint_for_vehicle(vehicle_id)
     if not endpoint:
         return False, "No local device endpoint configured"
 
-    ota_id = str(firmware_info.get("ota_id") or "").strip() or _build_ota_id(vehicle_id)
     payload = {
         "ota_id": ota_id,
         "url": firmware_info.get("url", ""),
         "target_version": firmware_info.get("version", ""),
-        "expected_sha256": firmware_info.get("sha256", ""),
-        "expected_size": int(firmware_info.get("size") or 0),
+        "sha256": firmware_info.get("sha256", ""),
+        "size": firmware_info.get("size", 0),
+        "signature": firmware_info.get("signature"),
     }
-    if isinstance(firmware_info.get("signature"), dict):
-        payload["signature"] = firmware_info.get("signature")
     try:
         resp = requests.post(
             f"{endpoint}/ota/start",
@@ -518,7 +634,6 @@ def _pick_latest_active_firmware():
         preferred = active_query.filter(Firmware.filename.ilike('%.raucb')).order_by(Firmware.created_at.desc()).first()
         if preferred:
             return preferred
-        return None
     return active_query.order_by(Firmware.created_at.desc()).first()
 
 
@@ -553,268 +668,16 @@ def _normalize_active_firmware():
     return keep
 
 
-def _resolve_target_firmware(target_version: str | None):
-    if target_version:
-        firmware = Firmware.query.filter_by(version=target_version).first()
-        if not firmware:
-            return None, (
-                jsonify({
-                    'error': f'Firmware version {target_version} not found',
-                    'target_version': target_version,
-                }),
-                404,
-            )
-        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
-            return None, (
-                jsonify({
-                    'error': 'Only .raucb firmware bundles are supported',
-                    'target_version': firmware.version,
-                    'filename': firmware.filename,
-                }),
-                409,
-            )
-        return firmware, None
-
-    firmware = _pick_latest_active_firmware()
-    if not firmware:
-        if Config.PREFER_RAUCB_FIRMWARE:
-            return None, (
-                jsonify({'error': 'No active .raucb firmware found'}),
-                404,
-            )
-        return None, (jsonify({'error': 'No active firmware found'}), 404)
-    return firmware, None
-
-
-def _validate_trigger_vehicle(vehicle_id: str, firmware: Firmware, force_trigger: bool, cmd_topic: str):
-    vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
-    if Config.REQUIRE_RECENT_VEHICLE and not force_trigger and not vehicle:
-        return None, (
-            jsonify({
-                'error': 'Vehicle not registered',
-                'vehicle_id': vehicle_id,
-                'hint': (
-                    "Check device_id in /etc/ota-backend/config.json and ensure "
-                    "it matches dashboard vehicle_id."
-                ),
-                'cmd_topic': cmd_topic,
-            }),
-            409,
-        )
-
-    if not vehicle or force_trigger:
-        return vehicle, None
-
-    in_progress_states = {'pending', 'downloading', 'verifying', 'installing'}
-    if str(vehicle.status or '').strip().lower() in in_progress_states:
-        return None, (
-            jsonify({
-                'error': 'Update already in progress',
-                'vehicle_id': vehicle_id,
-                'status': vehicle.status,
-                'hint': 'Wait for completion/reboot before sending another trigger.',
-            }),
-            409,
-        )
-
-    if vehicle.current_version and compare_versions(vehicle.current_version, firmware.version) >= 0:
-        return None, (
-            jsonify({
-                'error': 'Vehicle already up to date',
-                'vehicle_id': vehicle_id,
-                'current_version': vehicle.current_version,
-                'target_version': firmware.version,
-                'hint': 'Set force=true to trigger anyway.',
-            }),
-            409,
-        )
-
-    last_seen = vehicle.last_seen
-    now = datetime.utcnow()
-    if (not last_seen) or ((now - last_seen) > timedelta(seconds=Config.VEHICLE_ONLINE_WINDOW_SEC)):
-        return None, (
-            jsonify({
-                'error': 'Vehicle is offline or stale',
-                'vehicle_id': vehicle_id,
-                'last_seen': last_seen.isoformat() if last_seen else None,
-                'online_window_sec': Config.VEHICLE_ONLINE_WINDOW_SEC,
-                'hint': 'Set force=true to bypass this check.',
-                'cmd_topic': cmd_topic,
-            }),
-            409,
-        )
-
-    return vehicle, None
-
-
-def _build_trigger_firmware_info(vehicle_id: str, firmware: Firmware):
-    if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
-        return None, (
-            jsonify({
-                'error': 'Only .raucb firmware bundles are supported',
-                'target_version': firmware.version,
-                'filename': firmware.filename,
-            }),
-            409,
-        )
-
-    firmware_url = build_firmware_url(firmware.filename)
-    if not firmware_url:
-        return None, (
-            jsonify({
-                'error': 'Firmware is not available for distribution',
-                'target_version': firmware.version,
-                'hint': 'Check firmware upload result and OTA_GH_FIRMWARE_BASE_URL/OCI settings.',
-            }),
-            409,
-        )
-    if _url_points_to_localhost(firmware_url):
-        return None, (
-            jsonify({
-                'error': 'Firmware URL resolves to localhost',
-                'computed_url': firmware_url,
-                'hint': 'Set OTA_GH_FIRMWARE_BASE_URL=http://<HOST_IP>:8080 and restart ota_gh_server.',
-            }),
-            409,
-        )
-
-    firmware_info = {
-        'ota_id': _build_ota_id(vehicle_id),
-        'version': firmware.version,
-        'url': firmware_url,
-        'sha256': firmware.sha256,
-        'size': firmware.file_size,
-        'release_notes': firmware.release_notes or '',
-    }
-    return firmware_info, None
-
-
-def _attach_command_signature(vehicle_id: str, firmware_info: dict):
-    payload_bytes = _canonical_command_payload(
-        ota_id=firmware_info['ota_id'],
-        url=firmware_info['url'],
-        target_version=firmware_info['version'],
-        expected_sha256=firmware_info['sha256'],
-        expected_size=int(firmware_info['size'] or 0),
-    )
-    signature, sign_error = _sign_command_payload(payload_bytes)
-    if signature:
-        firmware_info['signature'] = signature
-        return None
-    if sign_error and Config.COMMAND_SIGN_REQUIRE:
-        logger.error("Refusing trigger for %s: %s", vehicle_id, sign_error)
-        return jsonify({
-            'error': 'Failed to sign OTA command',
-            'detail': sign_error,
-            'hint': 'Check OTA_GH command-signing key configuration.',
-        }), 500
-    if sign_error:
-        logger.warning("Command signing skipped for %s: %s", vehicle_id, sign_error)
-    return None
-
-
-def _publish_trigger_command(vehicle_id: str, firmware_info: dict, cmd_topic: str):
-    if (mqtt_handler is None) or (not mqtt_handler.is_connected()):
-        init_mqtt()
-
-    local_endpoint = _local_endpoint_for_vehicle(vehicle_id)
-    prefer_http = bool(local_endpoint) and bool(Config.LOCAL_TRIGGER_FIRST)
-
-    def _publish_mqtt() -> bool:
-        return bool(
-            mqtt_handler and
-            mqtt_handler.is_connected() and
-            mqtt_handler.publish_update_command(vehicle_id, firmware_info, firmware_info['ota_id'])
-        )
-
-    if Config.MQTT_COMMAND_ONLY:
-        if _publish_mqtt():
-            return "mqtt", f"MQTT command published to {cmd_topic}", None
-        return None, None, (
-            jsonify({
-                'error': 'Failed to send update command',
-                'detail': 'MQTT command publish failed or broker disconnected',
-                'cmd_topic': cmd_topic,
-            }),
-            500,
-        )
-
-    if prefer_http:
-        ok_http, reason_http = _trigger_device_http(vehicle_id, firmware_info)
-        if ok_http:
-            return "http", reason_http, None
-        if _publish_mqtt():
-            return "mqtt", f"HTTP trigger failed ({reason_http}); MQTT command published to {cmd_topic}", None
-        logger.error(
-            "Failed to trigger update for %s via HTTP-first and MQTT fallback: %s",
-            vehicle_id, reason_http
-        )
-        return None, None, (
-            jsonify({
-                'error': 'Failed to send update command',
-                'detail': reason_http,
-                'cmd_topic': cmd_topic,
-            }),
-            500,
-        )
-
-    if _publish_mqtt():
-        return "mqtt", f"MQTT command published to {cmd_topic}", None
-
-    ok_http, reason_http = _trigger_device_http(vehicle_id, firmware_info)
-    if ok_http:
-        return "http", reason_http, None
-
-    logger.error(
-        "Failed to trigger update for %s via both MQTT and HTTP fallback: %s",
-        vehicle_id, reason_http
-    )
-    return None, None, (
-        jsonify({
-            'error': 'Failed to send update command',
-            'detail': reason_http,
-            'cmd_topic': cmd_topic,
-        }),
-        500,
-    )
-
-
-def _record_pending_trigger(vehicle, vehicle_id: str, firmware: Firmware, trigger_note: str):
-    if not vehicle:
-        logger.warning(
-            "Update command sent to unknown vehicle_id=%s (no DB row, no pending history).",
-            vehicle_id
-        )
-        return
-
-    vehicle.status = 'pending'
-    pending = UpdateHistory(
-        vehicle_id=vehicle_id,
-        firmware_id=firmware.id,
-        from_version=vehicle.current_version,
-        target_version=firmware.version,
-        status='pending',
-        progress=0,
-        message=trigger_note
-    )
-    db.session.add(pending)
-    db.session.commit()
-
-
 @app.route('/health', methods=['GET'])
 def health_check():
     """서버의 헬스체크 엔드포인트"""
-    sign_key_path = str(Config.COMMAND_SIGN_KEY_PATH or "").strip()
     return jsonify({
         'status': 'healthy',
         'timestamp': datetime.utcnow().isoformat(),
         'mqtt_connected': mqtt_handler.is_connected() if mqtt_handler else False,
-        'require_recent_vehicle': bool(Config.REQUIRE_RECENT_VEHICLE),
-        'vehicle_online_window_sec': int(Config.VEHICLE_ONLINE_WINDOW_SEC),
-        'command_sign_enabled': bool(Config.COMMAND_SIGN_ENABLED),
-        'command_sign_required': bool(Config.COMMAND_SIGN_REQUIRE),
-        'command_sign_algo': Config.COMMAND_SIGN_ALGO,
-        'command_sign_key_exists': bool(sign_key_path and os.path.exists(sign_key_path)),
+        'mqtt_transport': Config.MQTT_TRANSPORT,
+        'mqtt_ws_path': Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == 'websockets' else '',
+        'mqtt_tls_enabled': Config.MQTT_TLS_ENABLED,
     }), 200
 
 
@@ -884,6 +747,7 @@ def update_check():
             }), 400
         
         logger.info(f"Update check request from vehicle {vehicle_id}, version {current_version}")
+        request_ip = _client_ip_from_request()
         
         # Vehicle upsert (없으면 생성, 있으면 업데이트)
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
@@ -898,6 +762,7 @@ def update_check():
             )
             db.session.add(vehicle)
             logger.info(f"New vehicle registered: {vehicle_id}")
+        _mark_vehicle_ip(vehicle, request_ip)
         
         db.session.commit()
         
@@ -918,16 +783,6 @@ def update_check():
         if comparison < 0:  # current_version < latest_version
             # 업데이트 가능
             firmware_url = build_firmware_url(latest_firmware.filename)
-            if not firmware_url:
-                logger.warning(
-                    "Update available for %s but firmware is not distributable: version=%s",
-                    vehicle_id,
-                    latest_firmware.version,
-                )
-                return jsonify({
-                    'update_available': False,
-                    'message': 'Active firmware is not downloadable yet'
-                })
             
             response = {
                 'update_available': True,
@@ -987,30 +842,39 @@ def report_status():
         
         vehicle_id = data['vehicle_id']
         target_version = data['target_version']
-        status = data['status']
+        incoming_status = data['status']
         progress = data.get('progress', 0)
         message = data.get('message', '')
         
         # 유효한 status 값 검증
         valid_statuses = ['downloading', 'verifying', 'installing', 'completed', 'failed']
-        if status not in valid_statuses:
-            return jsonify({'error': f'Invalid status: {status}'}), 400
+        if incoming_status not in valid_statuses:
+            return jsonify({'error': f'Invalid status: {incoming_status}'}), 400
         
         logger.info(
-            f"Status report from {vehicle_id}: {status} "
+            f"Status report from {vehicle_id}: {incoming_status} "
             f"({progress}%) for version {target_version}"
         )
+        request_ip = _client_ip_from_request()
         
         # Vehicle 조회 또는 생성
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if not vehicle:
-            vehicle = Vehicle(vehicle_id=vehicle_id, status=status)
+            vehicle = Vehicle(vehicle_id=vehicle_id, status=incoming_status)
             db.session.add(vehicle)
         else:
-            vehicle.status = status
             vehicle.last_seen = datetime.utcnow()
-        
-        # completed 상태면 current_version 업데이트
+        _mark_vehicle_ip(vehicle, request_ip)
+        prev_version = str(vehicle.current_version or "").strip()
+
+        status, message = normalize_completed_status_by_version(
+            incoming_status,
+            prev_version=prev_version,
+            target_version=target_version,
+            message=message,
+        )
+
+        vehicle.status = status
         if status == 'completed':
             vehicle.current_version = target_version
         
@@ -1035,7 +899,7 @@ def report_status():
             history = UpdateHistory(
                 vehicle_id=vehicle_id,
                 firmware_id=firmware.id if firmware else None,
-                from_version=vehicle.current_version if status != 'completed' else None,
+                from_version=prev_version or None,
                 target_version=target_version,
                 status=status,
                 progress=progress,
@@ -1071,194 +935,139 @@ def report_status():
         return jsonify({'error': 'Internal server error'}), 500
 
 
-def _stream_file_stats(stream) -> tuple[str, int]:
-    """업로드 스트림의 SHA256과 크기를 계산하고 시작 위치로 되돌린다."""
-    hasher = hashlib.sha256()
-    total_size = 0
+@app.route('/api/v1/client-logs', methods=['POST'])
+def ingest_client_logs():
+    """
+    OTA 클라이언트가 OTA 종료 시점에 업로드하는 raw log snapshot 저장 API.
+
+    Request Body:
+        {
+            "device_id": "vw-ivi-0026",
+            "device_model": "ivi-telechips",
+            "ota_id": "ota-...",
+            "current_version": "1.0.8",
+            "target_version": "1.1.0",
+            "phase": "APPLY|REBOOT|COMMIT|...",
+            "event": "OK|FAIL|START",
+            "current_slot": "A|B",
+            "ota_log": ["..."],
+            "last_log_line": "...",
+            "error": {...}
+        }
+    """
     try:
-        stream.seek(0)
-    except Exception as ex:
-        raise ValueError("Upload stream is not seekable") from ex
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'No JSON data provided'}), 400
 
-    while True:
-        chunk = stream.read(1024 * 1024)
-        if not chunk:
-            break
-        hasher.update(chunk)
-        total_size += len(chunk)
+        vehicle_id = str(data.get('device_id') or '').strip()
+        target_version = str(data.get('target_version') or '').strip()
+        phase = str(data.get('phase') or '').strip()
+        event = str(data.get('event') or '').strip()
+        current_version = str(data.get('current_version') or '').strip()
+        message = str(data.get('last_log_line') or '').strip()
+        error_obj = data.get('error') if isinstance(data.get('error'), dict) else {}
 
-    stream.seek(0)
-    return hasher.hexdigest(), total_size
+        if not vehicle_id or not target_version:
+            return jsonify({'error': 'Missing required fields: device_id, target_version'}), 400
 
+        ota_status = _phase_event_to_status(phase, event)
+        if error_obj and not message:
+            message = str(error_obj.get('message') or '').strip()
+        request_ip = _client_ip_from_request()
+        payload_ip = str(
+            ((data.get('context') or {}).get('network') or {}).get('ip')
+            or data.get('ip')
+            or ''
+        ).strip()
 
-def _upload_stream_to_oci(stream, filename: str) -> bool:
-    """영구 로컬 저장 없이 업로드 스트림을 OCI로 직접 전송."""
-    oci_url = _get_oci_object_url(filename)
-    if not oci_url:
-        logger.info("OCI PAR token not configured, skipping OCI upload")
-        return False
-    try:
-        stream.seek(0)
-        resp = requests.put(oci_url, data=stream, timeout=300)
-        if resp.status_code < 300:
-            logger.info("OCI upload success: %s (status=%d)", filename, resp.status_code)
-            stream.seek(0)
-            return True
+        vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
+        if not vehicle:
+            vehicle = Vehicle(vehicle_id=vehicle_id, status=ota_status or 'idle')
+            db.session.add(vehicle)
+
+        vehicle.last_seen = datetime.utcnow()
+        _mark_vehicle_ip(vehicle, payload_ip or request_ip)
+        if ota_status:
+            vehicle.status = ota_status
+        if ota_status == 'completed' and current_version:
+            vehicle.current_version = current_version
+
+        history = UpdateHistory.query.filter_by(
+            vehicle_id=vehicle_id,
+            target_version=target_version
+        ).order_by(UpdateHistory.started_at.desc()).first()
+
+        if history:
+            if ota_status:
+                history.status = ota_status
+            if message:
+                history.message = message
         else:
-            logger.error("OCI upload failed: %s (status=%d)", filename, resp.status_code)
-            stream.seek(0)
-            return False
+            firmware = Firmware.query.filter_by(version=target_version).first()
+            history = UpdateHistory(
+                vehicle_id=vehicle_id,
+                firmware_id=firmware.id if firmware else None,
+                from_version=current_version or None,
+                target_version=target_version,
+                status=ota_status or 'idle',
+                progress=100 if ota_status == 'completed' else 0,
+                message=message,
+            )
+            db.session.add(history)
+
+        captured_at = datetime.utcnow()
+        log_path = _persist_client_log_snapshot(
+            vehicle_id=vehicle_id,
+            target_version=target_version,
+            payload=data,
+            captured_at=captured_at,
+        )
+        history.client_log_json = None
+        history.client_log_path = log_path
+        history.client_log_updated_at = captured_at
+
+        db.session.commit()
+        logger.info(
+            "Stored client OTA log snapshot vehicle=%s target=%s phase=%s event=%s lines=%s path=%s",
+            vehicle_id,
+            target_version,
+            phase or '-',
+            event or '-',
+            len(data.get('ota_log') or []) if isinstance(data.get('ota_log'), list) else 0,
+            log_path,
+        )
+
+        return jsonify({'success': True}), 200
+
     except Exception as e:
-        logger.error("OCI upload error for %s: %s", filename, e)
-        try:
-            stream.seek(0)
-        except Exception:
-            pass
-        return False
-
-
-def _save_stream_to_local(stream, filename: str) -> tuple[str, str, int]:
-    """업로드 스트림을 로컬 펌웨어 디렉토리에 저장하면서 SHA256과 크기를 계산."""
-    target_path = _local_firmware_path(filename)
-    if not target_path:
-        raise ValueError("Invalid local firmware filename")
-    os.makedirs(Config.FIRMWARE_DIR, exist_ok=True)
-    hasher = hashlib.sha256()
-    total_size = 0
-    stream.seek(0)
-    with open(target_path, "wb") as out_file:
-        while True:
-            chunk = stream.read(1024 * 1024)
-            if not chunk:
-                break
-            out_file.write(chunk)
-            hasher.update(chunk)
-            total_size += len(chunk)
-    stream.seek(0)
-    return target_path, hasher.hexdigest(), total_size
-
-
-def _announce_new_release(firmware: Firmware):
-    """새 릴리즈 업로드 후 차량 announce 토픽으로 브로드캐스트."""
-    if not firmware:
-        return
-    firmware_url = build_firmware_url(firmware.filename)
-    if not firmware_url:
-        logger.warning(
-            "Skipping release announce: firmware URL unavailable (version=%s)",
-            firmware.version,
-        )
-        return
-    if not mqtt_handler or not mqtt_handler.is_connected():
-        logger.warning(
-            "Skipping release announce: MQTT not connected (version=%s)",
-            firmware.version,
-        )
-        return
-    release_info = {
-        "ota_id": _build_ota_id("release"),
-        "version": firmware.version,
-        "filename": firmware.filename,
-        "url": firmware_url,
-        "sha256": firmware.sha256,
-        "size": firmware.file_size,
-    }
-    ok = mqtt_handler.publish_release_announcement(release_info)
-    if not ok:
-        logger.warning("Release announce publish failed for version=%s", firmware.version)
+        logger.error(f"Error in ingest_client_logs: {e}", exc_info=True)
+        db.session.rollback()
+        return jsonify({'error': 'Internal server error'}), 500
 
 
 @app.route('/firmware/<filename>', methods=['GET'])
 def download_firmware(filename):
     """
     펌웨어 파일 다운로드
-    OCI URL 리다이렉트 또는 로컬 파일 다운로드를 제공한다.
+    
+    Args:
+        filename: 펌웨어 파일명
     """
     try:
         firmware = Firmware.query.filter_by(filename=filename).first_or_404()
-        if firmware.oci_uploaded:
-            oci_url = _get_oci_object_url(firmware.filename)
-            if oci_url:
-                return redirect(oci_url)
 
-        local_path = _local_firmware_path(firmware.filename)
-        if local_path and os.path.isfile(local_path):
-            return send_from_directory(
-                Config.FIRMWARE_DIR,
-                firmware.filename,
-                as_attachment=True,
-                download_name=firmware.filename,
-            )
-        return jsonify({'error': 'Firmware file not found'}), 404
+        guessed = mimetypes.guess_type(firmware.filename)[0]
+        return send_file(
+            firmware.file_path,
+            as_attachment=True,
+            download_name=filename,
+            mimetype=guessed or 'application/octet-stream'
+        )
     
     except Exception as e:
         logger.error(f"Error serving firmware: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
-
-
-@app.route('/api/ota/verify', methods=['POST'])
-def verify_ota_update():
-    """
-    OTA 업데이트 2차 검증 엔드포인트.
-    실서버에서는 LLM 검증이 비활성화된 경우 RAUC 무결성 검증 결과를 그대로 승인한다.
-    """
-    try:
-        ota_log = request.get_json()
-        if not ota_log:
-            return jsonify({"error": "No JSON body provided"}), 400
-
-        required_fields = ["firmware_metadata", "process_log", "device_state"]
-        for field in required_fields:
-            if field not in ota_log:
-                return jsonify({"error": f"Missing required field: {field}"}), 400
-
-        if _llm_enabled:
-            try:
-                from llm_verifier import (
-                    call_llm_verification,
-                    preprocess_log,
-                    save_verification_result,
-                )
-            except Exception as import_ex:
-                logger.error("LLM verifier unavailable: %s", import_ex, exc_info=True)
-                return jsonify({
-                    "decision": "REJECT",
-                    "reason": f"LLM verifier unavailable: {import_ex}. Fail-safe REJECT.",
-                    "timestamp": datetime.utcnow().isoformat() + "Z",
-                }), 500
-
-            preprocessed = preprocess_log(ota_log)
-            result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
-            try:
-                save_verification_result(ota_log, result)
-            except Exception as save_ex:
-                logger.error("Failed to save LLM verification result: %s", save_ex, exc_info=True)
-        else:
-            result = {
-                "decision": "APPROVE",
-                "reason": "LLM verification disabled. Relying on RAUC integrity check only.",
-            }
-
-        logger.info(
-            "OTA verify: vehicle=%s decision=%s llm_enabled=%s",
-            ota_log.get("device_state", {}).get("vehicle_id", "unknown"),
-            result["decision"],
-            _llm_enabled,
-        )
-
-        return jsonify({
-            "decision": result["decision"],
-            "reason": result["reason"],
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        })
-
-    except Exception as e:
-        logger.error(f"Error in verify_ota_update: {e}", exc_info=True)
-        return jsonify({
-            "decision": "REJECT",
-            "reason": f"서버 내부 오류로 Fail-safe REJECT: {str(e)}",
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-        }), 500
 
 
 @app.route('/api/v1/admin/firmware', methods=['POST'])
@@ -1273,6 +1082,7 @@ def upload_firmware():
         overwrite: 기존 버전/파일 덮어쓰기 여부 (선택, 기본 false)
     """
     try:
+        started_at = time.monotonic()
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
         
@@ -1287,22 +1097,25 @@ def upload_firmware():
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
         
-        original_name = file.filename or ''
-        if not secure_filename(original_name):
+        # 파일명 생성
+        original_name = secure_filename(file.filename or '')
+        if not original_name:
             return jsonify({'error': 'Invalid original filename'}), 400
 
-        filename = _build_upload_filename(
-            original_name=original_name,
-            version_str=version_str,
-            custom_name=(request.form.get('filename') or '').strip(),
-        )
-        if not filename:
-            return jsonify({'error': 'Invalid upload filename'}), 400
-        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(filename):
-            return jsonify({
-                'error': 'Only .raucb firmware bundles are supported',
-                'filename': filename,
-            }), 400
+        custom_name = secure_filename((request.form.get('filename') or '').strip())
+        if custom_name:
+            filename = custom_name
+        else:
+            if original_name.lower().endswith('.tar.gz'):
+                ext = '.tar.gz'
+            else:
+                _, ext = os.path.splitext(original_name)
+                ext = ext.lower()
+            if ext in {'', '.'}:
+                ext = '.tar.gz'
+            filename = f"app_{version_str}{ext}"
+
+        filepath = os.path.join(Config.FIRMWARE_DIR, filename)
 
         # 같은 버전이 이미 등록된 경우 기본적으로 거부
         existing_firmware = Firmware.query.filter_by(version=version_str).first()
@@ -1315,31 +1128,72 @@ def upload_firmware():
                 'firmware': existing_firmware.to_dict()
             }), 409
 
-        started_at = time.monotonic()
-        oci_uploaded = _upload_stream_to_oci(file.stream, filename)
-        if oci_uploaded:
-            sha256, file_size = _stream_file_stats(file.stream)
-            object_ref = _get_oci_object_ref(filename)
-        else:
-            try:
-                object_ref, sha256, file_size = _save_stream_to_local(file.stream, filename)
-                logger.info("Stored firmware locally: %s", object_ref)
-            except Exception as ex:
-                logger.error("Failed to store firmware locally: %s", ex, exc_info=True)
+        old_filepath = existing_firmware.file_path if existing_firmware else None
+
+        # 파일 저장: overwrite=false일 때 기존 파일 덮어쓰기 방지
+        if os.path.exists(filepath):
+            if not overwrite:
                 return jsonify({
-                    'error': 'Failed to store firmware',
-                    'detail': str(ex),
-                }), 500
+                    'error': (
+                        f'Firmware file {filename} already exists on server. '
+                        f'Use overwrite=true to replace it.'
+                    )
+                }), 409
+            os.remove(filepath)
+
+        file.stream.seek(0)
+        sha256_hash = hashlib.sha256()
+        file_size = 0
+        with open(filepath, 'wb') as fw:
+            while True:
+                chunk = file.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                fw.write(chunk)
+                sha256_hash.update(chunk)
+                file_size += len(chunk)
+
+        if not os.path.exists(filepath):
+            return jsonify({
+                'error': 'Failed to save uploaded firmware file'
+            }), 500
+
+        sha256 = sha256_hash.hexdigest()
+        save_and_hash_sec = time.monotonic() - started_at
+
+        same_artifact = Firmware.query.filter(
+            Firmware.sha256 == sha256,
+            Firmware.version != version_str,
+        ).first()
+        if same_artifact:
+            if os.path.exists(filepath) and filepath != same_artifact.file_path:
+                os.remove(filepath)
+            return jsonify({
+                'error': (
+                    f'The uploaded artifact is already registered as version '
+                    f'{same_artifact.version}. Re-labeling the same bundle under '
+                    f'a different version is blocked.'
+                ),
+                'firmware': same_artifact.to_dict(),
+            }), 409
+
+        # 기존 버전 파일 경로가 달라졌다면 잔여 파일 정리
+        if (
+            overwrite and
+            old_filepath and
+            old_filepath != filepath and
+            os.path.exists(old_filepath)
+        ):
+            os.remove(old_filepath)
         
         # DB 반영 (신규 등록 또는 기존 버전 갱신)
         if existing_firmware:
             existing_firmware.filename = filename
-            existing_firmware.file_path = object_ref
+            existing_firmware.file_path = filepath
             existing_firmware.file_size = file_size
             existing_firmware.sha256 = sha256
             existing_firmware.release_notes = release_notes
             existing_firmware.is_active = True
-            existing_firmware.oci_uploaded = oci_uploaded
             firmware = existing_firmware
             status_code = 200
             logger.info(f"Firmware replaced: {version_str} ({filename})")
@@ -1347,12 +1201,11 @@ def upload_firmware():
             firmware = Firmware(
                 version=version_str,
                 filename=filename,
-                file_path=object_ref,
+                file_path=filepath, 
                 file_size=file_size,
                 sha256=sha256,
                 release_notes=release_notes,
-                is_active=True,
-                oci_uploaded=oci_uploaded,
+                is_active=True
             )
             db.session.add(firmware)
             status_code = 201
@@ -1372,20 +1225,17 @@ def upload_firmware():
 
         total_sec = time.monotonic() - started_at
         logger.info(
-            "Firmware upload timing: version=%s file=%s size_mib=%.1f total_sec=%.2f oci=%s",
+            "Firmware upload timing: version=%s file=%s size_mib=%.1f save_hash_sec=%.2f total_sec=%.2f",
             version_str,
             filename,
             file_size / (1024.0 * 1024.0),
+            save_and_hash_sec,
             total_sec,
-            oci_uploaded,
         )
-
-        _announce_new_release(firmware)
 
         return jsonify({
             'success': True,
             'updated': bool(existing_firmware),
-            'oci_uploaded': oci_uploaded,
             'firmware': firmware.to_dict()
         }), status_code
 
@@ -1423,13 +1273,6 @@ def activate_firmware():
 
         if not firmware:
             return jsonify({'error': 'Firmware not found'}), 404
-        if Config.PREFER_RAUCB_FIRMWARE and not _is_rauc_bundle_filename(firmware.filename):
-            return jsonify({
-                'error': 'Only .raucb firmware bundles can be activated',
-                'id': firmware.id,
-                'version': firmware.version,
-                'filename': firmware.filename,
-            }), 409
 
         firmware.is_active = True
         db.session.flush()
@@ -1467,7 +1310,25 @@ def delete_firmware(firmware_id):
             return jsonify({'error': 'Firmware not found'}), 404
 
         was_active = bool(firmware.is_active)
-        removed_file = None
+        file_path = firmware.file_path
+        filename = firmware.filename
+
+        delete_report = _delete_firmware_artifacts(file_path, filename)
+        if delete_report['errors']:
+            logger.error(
+                "Refusing firmware delete id=%s version=%s due to file cleanup errors: %s",
+                firmware.id,
+                firmware.version,
+                delete_report['errors'],
+            )
+            return jsonify({
+                'error': 'Failed to delete firmware file from storage',
+                'deleted_id': firmware_id,
+                'file_path': file_path,
+                'removed_files': delete_report['removed_paths'],
+                'missing_files': delete_report['missing_paths'],
+                'file_delete_errors': delete_report['errors'],
+            }), 500
 
         # Keep update history rows; detach FK before delete.
         UpdateHistory.query.filter(
@@ -1497,7 +1358,9 @@ def delete_firmware(firmware_id):
         return jsonify({
             'success': True,
             'deleted_id': firmware_id,
-            'removed_file': removed_file,
+            'removed_file': delete_report['removed_paths'][0] if delete_report['removed_paths'] else None,
+            'removed_files': delete_report['removed_paths'],
+            'missing_files': delete_report['missing_paths'],
         }), 200
 
     except Exception as e:
@@ -1524,81 +1387,349 @@ def trigger_update():
             return jsonify({'error': 'vehicle_id is required'}), 400
         
         vehicle_id = data['vehicle_id']
-        if Config.LOCAL_PROBE_ENABLED:
+        if _local_probe_enabled() and bool(Config.LOCAL_TRIGGER_FIRST):
             _probe_local_devices_once(force=True)
         target_version = str(data.get('version') or '').strip() or None
         force_trigger = parse_bool(data.get('force'), default=False)
-        cmd_topic = _format_cmd_topic(vehicle_id)
-        firmware, error_response = _resolve_target_firmware(target_version)
-        if error_response:
-            return error_response
+        
+        # 특정 버전이 지정되면 active 여부와 무관하게 해당 버전을 사용한다.
+        # (대시보드에서 이전 버전/동일 버전 재설치를 허용하기 위함)
+        if target_version:
+            firmware = Firmware.query.filter_by(version=target_version).first()
+            if not firmware:
+                return jsonify({
+                    'error': f'Firmware version {target_version} not found',
+                    'target_version': target_version,
+                }), 404
+        else:
+            firmware = _pick_latest_active_firmware()
+        
+        if not firmware:
+            return jsonify({'error': 'No active firmware found'}), 404
 
-        vehicle, error_response = _validate_trigger_vehicle(vehicle_id, firmware, force_trigger, cmd_topic)
-        if error_response:
-            return error_response
+        # 기본 정책: 최근 접속 차량만 트리거 허용 (오프라인/ID 불일치 조기 탐지)
+        vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
+        if Config.REQUIRE_RECENT_VEHICLE and not force_trigger:
+            if not vehicle:
+                return jsonify({
+                    'error': 'Vehicle not registered',
+                    'vehicle_id': vehicle_id,
+                    'hint': (
+                        "Check device_id in /etc/ota-backend/config.json and ensure "
+                        "it matches dashboard vehicle_id."
+                    ),
+                    'cmd_topic': _format_cmd_topic(vehicle_id),
+                }), 409
 
-        firmware_info, error_response = _build_trigger_firmware_info(vehicle_id, firmware)
-        if error_response:
+        # 진행 중 상태에서 중복 트리거를 막아 false fail(OTA already running) 발생을 방지.
+        if vehicle and not force_trigger:
+            in_progress_states = {'pending', 'downloading', 'verifying', 'installing'}
+            if str(vehicle.status or '').strip().lower() in in_progress_states:
+                return jsonify({
+                    'error': 'Update already in progress',
+                    'vehicle_id': vehicle_id,
+                    'status': vehicle.status,
+                    'hint': 'Wait for completion/reboot before sending another trigger.',
+                }), 409
+
+            # 이미 동일(또는 더 높은) 버전이면 기본적으로 트리거를 막는다.
+            if vehicle.current_version:
+                cmp_result = compare_versions(vehicle.current_version, firmware.version)
+                if cmp_result >= 0:
+                    return jsonify({
+                        'error': 'Vehicle already up to date',
+                        'vehicle_id': vehicle_id,
+                        'current_version': vehicle.current_version,
+                        'target_version': firmware.version,
+                        'hint': 'Set force=true to trigger anyway.',
+                    }), 409
+
+            last_seen = vehicle.last_seen
+            now = datetime.utcnow()
+            if (not last_seen) or ((now - last_seen) > timedelta(seconds=Config.VEHICLE_ONLINE_WINDOW_SEC)):
+                return jsonify({
+                    'error': 'Vehicle is offline or stale',
+                    'vehicle_id': vehicle_id,
+                    'last_seen': last_seen.isoformat() if last_seen else None,
+                    'online_window_sec': Config.VEHICLE_ONLINE_WINDOW_SEC,
+                    'hint': 'Set force=true to bypass this check.',
+                    'cmd_topic': _format_cmd_topic(vehicle_id),
+                }), 409
+        
+        # 펌웨어 정보 구성
+        firmware_url = build_firmware_url(firmware.filename)
+        if _url_points_to_localhost(firmware_url):
             logger.error(
-                "Refusing trigger for %s: firmware version %s is not distributable.",
+                "Refusing trigger for %s: computed firmware URL points to localhost (%s).",
+                vehicle_id,
+                firmware_url,
+            )
+            return jsonify({
+                'error': 'Firmware URL resolves to localhost',
+                'computed_url': firmware_url,
+                'hint': 'Set OTA_GH_FIRMWARE_BASE_URL=http://<HOST_IP>:8080 and restart ota_gh_server.',
+            }), 409
+
+        ota_id = _build_ota_id(vehicle_id)
+        firmware_info = {
+            'version': firmware.version,
+            'url': firmware_url,
+            'sha256': firmware.sha256,
+            'size': firmware.file_size,
+            'release_notes': firmware.release_notes or ''
+        }
+        signature_obj, signature_error = _sign_command_payload(
+            ota_id=ota_id,
+            url=firmware_url,
+            target_version=firmware.version,
+            expected_sha256=firmware.sha256,
+            expected_size=int(firmware.file_size or 0),
+        )
+        if signature_obj:
+            firmware_info['signature'] = signature_obj
+        elif signature_error:
+            logger.warning(
+                "Command signing unavailable for vehicle=%s version=%s: %s",
                 vehicle_id,
                 firmware.version,
+                signature_error,
             )
-            return error_response
 
-        signature_error = _attach_command_signature(vehicle_id, firmware_info)
-        if signature_error:
-            return signature_error
+        # MQTT 연결이 끊겨 있으면 즉시 재연결 시도
+        if (mqtt_handler is None) or (not mqtt_handler.is_connected()):
+            init_mqtt()
 
-        sent_via, trigger_note, error_response = _publish_trigger_command(vehicle_id, firmware_info, cmd_topic)
-        if error_response:
-            return error_response
+        sent_via = None
+        trigger_note = ""
+        local_endpoint = _local_endpoint_for_vehicle(vehicle_id)
+        prefer_http = bool(local_endpoint) and bool(Config.LOCAL_TRIGGER_FIRST)
 
-        _record_pending_trigger(vehicle, vehicle_id, firmware, trigger_note)
-        logger.info(
-            "Update command sent to %s: %s via %s",
-            vehicle_id, firmware.version, sent_via
-        )
-        return jsonify({
-            'success': True,
-            'vehicle_id': vehicle_id,
-            'version': firmware.version,
-            'url': firmware_info['url'],
-            'cmd_topic': cmd_topic,
-            'transport': sent_via,
-        })
+        if prefer_http:
+            ok_http, reason_http = _trigger_device_http(vehicle_id, ota_id, firmware_info)
+            if ok_http:
+                sent_via = "http"
+                trigger_note = reason_http
+            elif mqtt_handler and mqtt_handler.is_connected() and mqtt_handler.publish_update_command(vehicle_id, firmware_info, ota_id=ota_id):
+                sent_via = "mqtt"
+                trigger_note = (
+                    f"HTTP trigger failed ({reason_http}); "
+                    f"MQTT command published to {_format_cmd_topic(vehicle_id)}"
+                )
+            else:
+                logger.error(
+                    "Failed to trigger update for %s via HTTP-first and MQTT fallback: %s",
+                    vehicle_id, reason_http
+                )
+                return jsonify({
+                    'error': 'Failed to send update command',
+                    'detail': reason_http,
+                    'cmd_topic': _format_cmd_topic(vehicle_id),
+                }), 500
+        else:
+            # MQTT 우선, 실패 시 HTTP 폴백
+            if mqtt_handler and mqtt_handler.is_connected() and mqtt_handler.publish_update_command(vehicle_id, firmware_info, ota_id=ota_id):
+                sent_via = "mqtt"
+                trigger_note = f"MQTT command published to {_format_cmd_topic(vehicle_id)}"
+            else:
+                ok_http, reason_http = _trigger_device_http(vehicle_id, ota_id, firmware_info)
+                if ok_http:
+                    sent_via = "http"
+                    trigger_note = reason_http
+                else:
+                    logger.error(
+                        "Failed to trigger update for %s via both MQTT and HTTP fallback: %s",
+                        vehicle_id, reason_http
+                    )
+                    return jsonify({
+                        'error': 'Failed to send update command',
+                        'detail': reason_http,
+                        'cmd_topic': _format_cmd_topic(vehicle_id),
+                    }), 500
+
+        if sent_via:
+            # IMPORTANT: keep last_seen as device heartbeat only.
+            # Do not refresh it on trigger request, otherwise stale/offline checks become meaningless.
+            if vehicle:
+                vehicle.status = 'pending'
+                pending = UpdateHistory(
+                    vehicle_id=vehicle_id,
+                    firmware_id=firmware.id,
+                    from_version=vehicle.current_version,
+                    target_version=firmware.version,
+                    status='pending',
+                    progress=0,
+                    message=trigger_note
+                )
+                db.session.add(pending)
+                db.session.commit()
+            else:
+                logger.warning(
+                    "Update command sent to unknown vehicle_id=%s (no DB row, no pending history).",
+                    vehicle_id
+                )
+
+            logger.info(
+                "Update command sent to %s: %s via %s",
+                vehicle_id, firmware.version, sent_via
+            )
+            return jsonify({
+                'success': True,
+                'vehicle_id': vehicle_id,
+                'version': firmware.version,
+                'ota_id': ota_id,
+                'url': firmware_url,
+                'cmd_topic': _format_cmd_topic(vehicle_id),
+                'transport': sent_via,
+            })
     
     except Exception as e:
         logger.error(f"Error triggering update: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
 
+# ── LLM 런타임 토글 상태 ──────────────────────
+_llm_enabled = Config.LLM_VERIFICATION_ENABLED
+
+
+@app.route('/api/v1/llm/config', methods=['GET'])
+def get_llm_config():
+    """LLM 검증 설정 조회."""
+    return jsonify({
+        'enabled': _llm_enabled,
+        'model': Config.LLM_MODEL,
+    })
+
+
+@app.route('/api/v1/llm/config', methods=['POST'])
+def set_llm_config():
+    """LLM 검증 ON/OFF 런타임 토글."""
+    global _llm_enabled
+    data = request.get_json() or {}
+    if 'enabled' in data:
+        _llm_enabled = bool(data['enabled'])
+        logger.info(f"LLM verification toggled: {'ON' if _llm_enabled else 'OFF'}")
+    return jsonify({
+        'enabled': _llm_enabled,
+        'model': Config.LLM_MODEL,
+    })
+
+
+@app.route('/api/ota/verify', methods=['POST'])
+def verify_ota_update():
+    """
+    OTA 업데이트 LLM 2차 검증 엔드포인트.
+    클라이언트로부터 OTA 로그를 수신하고, LLM 기반 검증 결과를 반환한다.
+    """
+    try:
+        ota_log = request.get_json()
+        if not ota_log:
+            return jsonify({"error": "No JSON body provided"}), 400
+
+        required_fields = ["firmware_metadata", "process_log", "device_state"]
+        for field in required_fields:
+            if field not in ota_log:
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        if _llm_enabled:
+            preprocessed = preprocess_log(ota_log)
+            result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
+        else:
+            # LLM OFF: 로그만 저장하고 무조건 APPROVE
+            result = {
+                "decision": "APPROVE",
+                "reason": "LLM verification disabled. Relying on RAUC integrity check only.",
+                "raw_response": None,
+            }
+
+        save_verification_result(ota_log, result)
+
+        logger.info(
+            "OTA verify: vehicle=%s decision=%s llm_enabled=%s",
+            ota_log.get("device_state", {}).get("vehicle_id", "unknown"),
+            result["decision"],
+            _llm_enabled,
+        )
+
+        return jsonify({
+            "decision": result["decision"],
+            "reason": result["reason"],
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        })
+
+    except Exception as e:
+        logger.error(f"Error in verify_ota_update: {e}", exc_info=True)
+        return jsonify({
+            "decision": "REJECT",
+            "reason": f"서버 내부 오류로 Fail-safe REJECT: {str(e)}",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }), 500
+
+
+@app.route('/api/v1/llm/results', methods=['GET'])
+def list_llm_results():
+    """LLM 검증 결과 목록 조회 (대시보드용)."""
+    try:
+        from llm_verifier import _get_verification_db
+        limit = request.args.get('limit', 50, type=int)
+        conn = _get_verification_db()
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM verification_results ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        conn.close()
+        results = []
+        for row in rows:
+            r = dict(row)
+            try:
+                r['ota_log'] = json.loads(r.get('ota_log_json') or '{}')
+            except Exception:
+                r['ota_log'] = {}
+            r.pop('ota_log_json', None)
+            results.append(r)
+        return jsonify({'results': results, 'total': len(results), 'llm_enabled': _llm_enabled})
+    except Exception as e:
+        logger.error(f"Error listing LLM results: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/v1/llm/logs', methods=['GET'])
+def get_llm_logs():
+    """LLM verifier 최근 로그 조회."""
+    try:
+        lines = request.args.get('lines', 200, type=int)
+        lines = max(1, min(lines or 200, 1000))
+        log_path = get_llm_log_path()
+        if not os.path.exists(log_path):
+            return jsonify({
+                'path': log_path,
+                'exists': False,
+                'lines': [],
+                'text': '',
+            })
+
+        with open(log_path, 'r', encoding='utf-8', errors='replace') as fp:
+            all_lines = fp.readlines()
+        selected_lines = all_lines[-lines:]
+        return jsonify({
+            'path': log_path,
+            'exists': True,
+            'line_count': len(selected_lines),
+            'lines': [line.rstrip('\n') for line in selected_lines],
+            'text': ''.join(selected_lines),
+        })
+    except Exception as e:
+        logger.error(f"Error reading LLM logs: {e}", exc_info=True)
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/v1/vehicles', methods=['GET'])
 def list_vehicles():
     """차량 목록 조회"""
     try:
-        if Config.LOCAL_PROBE_ENABLED:
-            _probe_local_devices_once(force=True)
         vehicles = Vehicle.query.order_by(Vehicle.last_seen.desc()).all()
-        now = datetime.utcnow()
-        online_window_sec = int(Config.VEHICLE_ONLINE_WINDOW_SEC)
-
-        def _to_vehicle_payload(vehicle: Vehicle) -> dict:
-            payload = vehicle.to_dict()
-            is_offline_status = str(vehicle.status or "").strip().lower() == "offline"
-            if vehicle.last_seen:
-                age_sec = max(0, int((now - vehicle.last_seen).total_seconds()))
-                payload['last_seen_age_sec'] = age_sec
-                payload['online_window_sec'] = online_window_sec
-                payload['online'] = (not is_offline_status) and (age_sec <= online_window_sec)
-            else:
-                payload['last_seen_age_sec'] = None
-                payload['online_window_sec'] = online_window_sec
-                payload['online'] = False
-            return payload
-
         return jsonify({
-            'vehicles': [_to_vehicle_payload(v) for v in vehicles],
+            'vehicles': [_serialize_vehicle(v) for v in vehicles],
             'total': len(vehicles)
         })
     except Exception as e:
@@ -1614,22 +1745,55 @@ def get_vehicle(vehicle_id):
         if not vehicle:
             return jsonify({'error': 'Vehicle not found'}), 404
 
-        payload = vehicle.to_dict()
-        online_window_sec = int(Config.VEHICLE_ONLINE_WINDOW_SEC)
-        is_offline_status = str(vehicle.status or "").strip().lower() == "offline"
-        if vehicle.last_seen:
-            age_sec = max(0, int((datetime.utcnow() - vehicle.last_seen).total_seconds()))
-            payload['last_seen_age_sec'] = age_sec
-            payload['online_window_sec'] = online_window_sec
-            payload['online'] = (not is_offline_status) and (age_sec <= online_window_sec)
-        else:
-            payload['last_seen_age_sec'] = None
-            payload['online_window_sec'] = online_window_sec
-            payload['online'] = False
-        return jsonify(payload), 200
+        return jsonify(_serialize_vehicle(vehicle)), 200
 
     except Exception as e:
         logger.error(f"Error getting vehicle: {e}", exc_info=True)
+        return jsonify({'error': 'Internal server error'}), 500
+
+
+@app.route('/api/v1/vehicles/<vehicle_id>/client-log', methods=['GET'])
+def get_vehicle_client_log(vehicle_id):
+    """차량의 최신 OTA log snapshot 조회."""
+    try:
+        target_version = str(request.args.get('target_version') or '').strip()
+
+        query = UpdateHistory.query.filter_by(vehicle_id=vehicle_id)
+        if target_version:
+            query = query.filter_by(target_version=target_version)
+
+        history = query.order_by(
+            UpdateHistory.client_log_updated_at.desc(),
+            UpdateHistory.started_at.desc()
+        ).first()
+
+        if not history:
+            return jsonify({'error': 'Client log not found'}), 404
+
+        payload = {}
+        if history.client_log_path and os.path.exists(history.client_log_path):
+            try:
+                with open(history.client_log_path, 'r', encoding='utf-8') as fp:
+                    payload = json.load(fp)
+            except Exception:
+                payload = {}
+        elif history.client_log_json:
+            try:
+                payload = json.loads(history.client_log_json or '{}')
+            except Exception:
+                payload = {}
+
+        return jsonify({
+            'vehicle_id': vehicle_id,
+            'target_version': history.target_version,
+            'history_id': history.id,
+            'client_log_path': history.client_log_path,
+            'updated_at': history.client_log_updated_at.isoformat() if history.client_log_updated_at else None,
+            'payload': payload,
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Error getting vehicle client log: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
 
 
@@ -1661,17 +1825,8 @@ def shutdown_session(exception=None):
 
 
 if __name__ == '__main__':
-    # 설정 검증
-    Config.validate()
-    
-    # 데이터베이스 초기화
-    init_db()
-    with app.app_context():
-        _normalize_active_firmware()
-    
-    # MQTT 핸들러 초기화
-    init_mqtt()
-    
+    initialize_server_runtime()
+
     # 서버 시작
     logger.info(f"Starting OTA Server on {Config.HOST}:{Config.PORT}")
     app.run(

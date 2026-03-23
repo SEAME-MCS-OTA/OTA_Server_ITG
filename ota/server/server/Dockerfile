@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1
+
 # 작업 디렉토리 설정
 WORKDIR /app
 
@@ -28,4 +30,6 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import requests; requests.get('http://localhost:8080/health')"
 
 # 애플리케이션 실행
-CMD ["python", "app.py"]
+# Use a single worker because the server owns one MQTT subscription loop.
+# Add threads so concurrent dashboard/API requests do not pile up on Flask dev server.
+CMD ["sh", "-c", "exec gunicorn --worker-class gthread --workers ${GUNICORN_WORKERS:-1} --threads ${GUNICORN_THREADS:-8} --timeout ${GUNICORN_TIMEOUT:-120} --keep-alive ${GUNICORN_KEEPALIVE:-10} --max-requests ${GUNICORN_MAX_REQUESTS:-1000} --max-requests-jitter ${GUNICORN_MAX_REQUESTS_JITTER:-100} --bind 0.0.0.0:${PORT:-8080} wsgi:application"]

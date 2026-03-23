@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   RefreshCw,
   Server,
@@ -12,6 +12,11 @@ import {
   BarChart3,
   Activity,
   MapPin,
+  ShieldCheck,
+  ShieldX,
+  Brain,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { MapContainer, TileLayer, CircleMarker, Tooltip as LeafletTooltip } from 'react-leaflet';
 
@@ -23,8 +28,10 @@ const MONITORING_API_BASE_URL =
   import.meta.env.VITE_VLM_API_URL ||
   `${window.location.protocol}//${window.location.hostname}:4000`;
 
-const REFRESH_INTERVAL = 5000;
-const DEFAULT_ONLINE_WINDOW_SEC = 300;
+const OPERATIONS_REFRESH_INTERVAL = 10000;
+const MONITORING_REFRESH_INTERVAL = 30000;
+const LLM_REFRESH_INTERVAL = 30000;
+const ONLINE_WINDOW_SEC = 60;
 
 const OTADashboard = () => {
   const [activeTab, setActiveTab] = useState('operations');
@@ -51,7 +58,18 @@ const OTADashboard = () => {
   const [monitoringError, setMonitoringError] = useState('');
   const [monitoringCity, setMonitoringCity] = useState('');
 
+  const [llmResults, setLlmResults] = useState([]);
+  const [llmLoading, setLlmLoading] = useState(true);
+  const [llmError, setLlmError] = useState('');
+  const [llmExpandedId, setLlmExpandedId] = useState(null);
+  const [llmEnabled, setLlmEnabled] = useState(true);
+  const [llmToggling, setLlmToggling] = useState(false);
+  const [llmLogText, setLlmLogText] = useState('');
+  const [llmLogPath, setLlmLogPath] = useState('');
+  const [llmLogError, setLlmLogError] = useState('');
+
   const [lastUpdate, setLastUpdate] = useState(new Date());
+  const refreshInFlightRef = useRef(false);
 
   const fetchJsonOrThrow = async (url) => {
     const res = await fetch(url);
@@ -89,11 +107,6 @@ const OTADashboard = () => {
   };
 
   const fetchMonitoringData = async () => {
-    if (!MONITORING_API_BASE_URL) {
-      setMonitoringError('');
-      setMonitoringLoading(false);
-      return;
-    }
     try {
       const cityQuery = monitoringCity ? `?city=${encodeURIComponent(monitoringCity)}` : '';
       const labels = ['summary', 'rootCause', 'cities', 'timeBucket', 'models', 'network'];
@@ -136,21 +149,95 @@ const OTADashboard = () => {
     }
   };
 
-  const fetchAllData = async () => {
-    await Promise.allSettled([fetchOperationsData(), fetchMonitoringData()]);
-    setLastUpdate(new Date());
+  const fetchLlmData = async () => {
+    try {
+      const [resultsData, configData, logsData] = await Promise.all([
+        fetchJsonOrThrow(`${API_BASE_URL}/api/v1/llm/results?limit=50`),
+        fetchJsonOrThrow(`${API_BASE_URL}/api/v1/llm/config`),
+        fetchJsonOrThrow(`${API_BASE_URL}/api/v1/llm/logs?lines=200`),
+      ]);
+      setLlmResults(resultsData.results || []);
+      setLlmEnabled(configData.enabled ?? true);
+      setLlmError('');
+      setLlmLogPath(logsData.path || '');
+      setLlmLogText(logsData.text || '');
+      setLlmLogError('');
+    } catch (error) {
+      console.error('Failed to fetch LLM data:', error);
+      setLlmError(error.message || 'Failed to fetch LLM results');
+      setLlmLogError(error.message || 'Failed to fetch LLM logs');
+    } finally {
+      setLlmLoading(false);
+    }
+  };
+
+  const toggleLlm = async () => {
+    setLlmToggling(true);
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/v1/llm/config`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !llmEnabled }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      setLlmEnabled(data.enabled);
+    } catch (error) {
+      console.error('Failed to toggle LLM:', error);
+    } finally {
+      setLlmToggling(false);
+    }
+  };
+
+  const fetchAllData = async ({ includeAllTabs = false } = {}) => {
+    if (refreshInFlightRef.current) {
+      return;
+    }
+
+    refreshInFlightRef.current = true;
+    try {
+      const jobs = [fetchOperationsData()];
+      if (includeAllTabs || activeTab === 'monitoring') {
+        jobs.push(fetchMonitoringData());
+      }
+      if (includeAllTabs || activeTab === 'llm') {
+        jobs.push(fetchLlmData());
+      }
+      await Promise.allSettled(jobs);
+      setLastUpdate(new Date());
+    } finally {
+      refreshInFlightRef.current = false;
+    }
   };
 
   useEffect(() => {
+    const intervalMs =
+      activeTab === 'monitoring'
+        ? MONITORING_REFRESH_INTERVAL
+        : activeTab === 'llm'
+          ? LLM_REFRESH_INTERVAL
+          : OPERATIONS_REFRESH_INTERVAL;
+
     const tick = () => {
-      if (!uploading) {
-        fetchAllData();
+      if (!uploading && !document.hidden) {
+        fetchAllData({ includeAllTabs: false });
       }
     };
+
+    const onVisibilityChange = () => {
+      if (!document.hidden && !uploading) {
+        fetchAllData({ includeAllTabs: false });
+      }
+    };
+
     tick();
-    const interval = setInterval(tick, REFRESH_INTERVAL);
-    return () => clearInterval(interval);
-  }, [monitoringCity, uploading]);
+    const interval = setInterval(tick, intervalMs);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [activeTab, monitoringCity, uploading]);
 
   const getStatusColor = (status) => {
     const colors = {
@@ -177,12 +264,10 @@ const OTADashboard = () => {
 
   const isVehicleOnline = (lastSeen) => {
     if (!lastSeen) return false;
-    const serverWindowSec = Number(serverHealth?.vehicle_online_window_sec || 0);
-    const onlineWindowSec = serverWindowSec > 0 ? serverWindowSec : DEFAULT_ONLINE_WINDOW_SEC;
     const seenDate = parseServerDate(lastSeen);
     if (!seenDate) return false;
     const ageSec = (Date.now() - seenDate.getTime()) / 1000;
-    return ageSec <= onlineWindowSec;
+    return ageSec <= ONLINE_WINDOW_SEC;
   };
 
   const getStatusIcon = (status) => {
@@ -495,7 +580,7 @@ const OTADashboard = () => {
               </div>
 
               <button
-                onClick={fetchAllData}
+                onClick={() => fetchAllData({ includeAllTabs: true })}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />
@@ -529,6 +614,19 @@ const OTADashboard = () => {
               <div className="flex items-center gap-2">
                 <BarChart3 className="w-4 h-4" />
                 Monitoring
+              </div>
+            </button>
+            <button
+              onClick={() => setActiveTab('llm')}
+              className={`px-4 py-2 rounded-lg text-sm font-medium border transition-colors ${
+                activeTab === 'llm'
+                  ? 'bg-blue-600 text-white border-blue-600'
+                  : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-100'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <Brain className="w-4 h-4" />
+                LLM Verification
               </div>
             </button>
           </div>
@@ -737,8 +835,8 @@ const OTADashboard = () => {
                                   <p className="font-medium text-gray-900">{vehicle.current_version || '-'}</p>
                                 </div>
                                 <div>
-                                  <p className="text-gray-500">Last IP</p>
-                                  <p className="font-medium text-gray-900">{vehicle.last_ip || '-'}</p>
+                                  <p className="text-gray-500">IP</p>
+                                  <p className="font-mono text-gray-900">{vehicle.last_ip || '-'}</p>
                                 </div>
                                 <div>
                                   <p className="text-gray-500">Last Seen</p>
@@ -846,71 +944,66 @@ const OTADashboard = () => {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                  <div className="lg:col-span-2">
-                    <div className="h-72 rounded-lg border border-slate-300 overflow-hidden">
-                      <MapContainer
-                        center={[51.1657, 10.4515]}
-                        zoom={6}
-                        scrollWheelZoom={true}
-                        className="h-full w-full"
-                      >
-                        <TileLayer
-                          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-                          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                        />
-                        {mapCities.map((city) => {
-                          const lat = Number(city.coords?.lat);
-                          const lon = Number(city.coords?.lon);
-                          if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-                          const rate = Number(city.failure_rate || 0);
-                          const radius = 7 + Math.round(Math.min(10, rate * 20));
-                          const active = monitoringCity === city.city;
-                          return (
-                            <CircleMarker
-                              key={`marker-${city.city}`}
-                              center={[lat, lon]}
-                              radius={radius}
-                              pathOptions={{
-                                color: active ? '#ffffff' : '#fde68a',
-                                weight: active ? 3 : 2,
-                                fillColor: active ? '#ef4444' : '#f59e0b',
-                                fillOpacity: 0.85,
-                              }}
-                              eventHandlers={{
-                                click: () =>
-                                  setMonitoringCity((prev) => (prev === city.city ? '' : city.city)),
-                              }}
-                            >
-                              <LeafletTooltip direction="top" offset={[0, -8]} opacity={0.95}>
-                                <div className="text-xs">
-                                  <div className="font-semibold">{city.city}</div>
-                                  <div>
-                                    {city.failures}/{city.total} ({(rate * 100).toFixed(1)}%)
+                {mapCities.length === 0 ? (
+                  <p className="text-sm text-gray-500">No city coordinate data available.</p>
+                ) : (
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                    <div className="lg:col-span-2">
+                      <div className="h-72 rounded-lg border border-slate-300 overflow-hidden">
+                        <MapContainer
+                          center={[51.1657, 10.4515]}
+                          zoom={6}
+                          scrollWheelZoom={true}
+                          className="h-full w-full"
+                        >
+                          <TileLayer
+                            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+                          />
+                          {mapCities.map((city) => {
+                            const lat = Number(city.coords?.lat);
+                            const lon = Number(city.coords?.lon);
+                            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+                            const rate = Number(city.failure_rate || 0);
+                            const radius = 7 + Math.round(Math.min(10, rate * 20));
+                            const active = monitoringCity === city.city;
+                            return (
+                              <CircleMarker
+                                key={`marker-${city.city}`}
+                                center={[lat, lon]}
+                                radius={radius}
+                                pathOptions={{
+                                  color: active ? '#ffffff' : '#fde68a',
+                                  weight: active ? 3 : 2,
+                                  fillColor: active ? '#ef4444' : '#f59e0b',
+                                  fillOpacity: 0.85,
+                                }}
+                                eventHandlers={{
+                                  click: () =>
+                                    setMonitoringCity((prev) => (prev === city.city ? '' : city.city)),
+                                }}
+                              >
+                                <LeafletTooltip direction="top" offset={[0, -8]} opacity={0.95}>
+                                  <div className="text-xs">
+                                    <div className="font-semibold">{city.city}</div>
+                                    <div>
+                                      {city.failures}/{city.total} ({(rate * 100).toFixed(1)}%)
+                                    </div>
                                   </div>
-                                </div>
-                              </LeafletTooltip>
-                            </CircleMarker>
-                          );
-                        })}
-                      </MapContainer>
-                    </div>
-                    <p className="text-[11px] text-gray-500 mt-2">
-                      Map data: OpenStreetMap. Click marker to filter.
-                    </p>
-                    {mapCities.length === 0 && (
-                      <p className="text-xs text-gray-500 mt-1">
-                        No city coordinate data available yet.
+                                </LeafletTooltip>
+                              </CircleMarker>
+                            );
+                          })}
+                        </MapContainer>
+                      </div>
+                      <p className="text-[11px] text-gray-500 mt-2">
+                        Map data: OpenStreetMap. Click marker to filter.
                       </p>
-                    )}
-                  </div>
-                  <div className="bg-gray-50 rounded-lg border border-gray-200 p-3 overflow-auto max-h-72">
-                    <div className="text-xs font-semibold text-gray-700 mb-2">Top Cities</div>
-                    <div className="space-y-1">
-                      {sortedCities.length === 0 ? (
-                        <p className="text-xs text-gray-500">No city data yet.</p>
-                      ) : (
-                        sortedCities.slice(0, 12).map((city) => {
+                    </div>
+                    <div className="bg-gray-50 rounded-lg border border-gray-200 p-3 overflow-auto max-h-72">
+                      <div className="text-xs font-semibold text-gray-700 mb-2">Top Cities</div>
+                      <div className="space-y-1">
+                        {sortedCities.slice(0, 12).map((city) => {
                           const active = monitoringCity === city.city;
                           return (
                             <button
@@ -933,11 +1026,11 @@ const OTADashboard = () => {
                               </div>
                             </button>
                           );
-                        })
-                      )}
+                        })}
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
 
               <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -1019,6 +1112,202 @@ const OTADashboard = () => {
                       )}
                     </div>
                   </div>
+                </div>
+              </div>
+            </div>
+          ))}
+
+        {activeTab === 'llm' &&
+          (llmLoading ? (
+            <div className="flex items-center justify-center h-64">
+              <RefreshCw className="w-8 h-8 text-blue-600 animate-spin" />
+            </div>
+          ) : (
+            <div className="space-y-6">
+              {llmError && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-4 text-sm">
+                  LLM backend warning: {llmError}
+                </div>
+              )}
+
+              {/* LLM ON/OFF 토글 */}
+              <div className={`rounded-lg shadow border p-5 flex items-center justify-between ${
+                llmEnabled
+                  ? 'bg-green-50 border-green-200'
+                  : 'bg-gray-50 border-gray-200'
+              }`}>
+                <div className="flex items-center gap-3">
+                  <Brain className={`w-6 h-6 ${llmEnabled ? 'text-green-600' : 'text-gray-400'}`} />
+                  <div>
+                    <p className="font-semibold text-gray-900">
+                      LLM 2nd Verification
+                      <span className={`ml-2 px-2 py-0.5 text-xs font-bold rounded-full ${
+                        llmEnabled
+                          ? 'bg-green-100 text-green-800'
+                          : 'bg-gray-200 text-gray-600'
+                      }`}>
+                        {llmEnabled ? 'ON' : 'OFF'}
+                      </span>
+                    </p>
+                    <p className="text-sm text-gray-500 mt-0.5">
+                      {llmEnabled
+                        ? 'Claude API analyzes OTA logs for security anomalies. REJECT blocks slot switch.'
+                        : 'LLM disabled: logs are saved but updates auto-APPROVE (RAUC check only).'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={toggleLlm}
+                  disabled={llmToggling}
+                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-offset-2 ${
+                    llmEnabled
+                      ? 'bg-green-500 focus:ring-green-500'
+                      : 'bg-gray-300 focus:ring-gray-400'
+                  } ${llmToggling ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer'}`}
+                >
+                  <span
+                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform ${
+                      llmEnabled ? 'translate-x-8' : 'translate-x-1'
+                    }`}
+                  />
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
+                  <p className="text-sm text-gray-600">Total Verifications</p>
+                  <p className="text-3xl font-bold text-gray-900 mt-1">{llmResults.length}</p>
+                </div>
+                <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheck className="w-5 h-5 text-green-600" />
+                    <p className="text-sm text-gray-600">APPROVE</p>
+                  </div>
+                  <p className="text-3xl font-bold text-green-600 mt-1">
+                    {llmResults.filter((r) => r.decision === 'APPROVE').length}
+                  </p>
+                </div>
+                <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
+                  <div className="flex items-center gap-2">
+                    <ShieldX className="w-5 h-5 text-red-600" />
+                    <p className="text-sm text-gray-600">REJECT</p>
+                  </div>
+                  <p className="text-3xl font-bold text-red-600 mt-1">
+                    {llmResults.filter((r) => r.decision === 'REJECT').length}
+                  </p>
+                </div>
+                <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
+                  <p className="text-sm text-gray-600">Reject Rate</p>
+                  <p className="text-3xl font-bold text-gray-900 mt-1">
+                    {llmResults.length > 0
+                      ? ((llmResults.filter((r) => r.decision === 'REJECT').length / llmResults.length) * 100).toFixed(1)
+                      : '0.0'}
+                    %
+                  </p>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-lg shadow border border-gray-200">
+                <div className="px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">LLM Runtime Log</h2>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Recent verifier events from the server runtime. Path: {llmLogPath || '-'}
+                  </p>
+                </div>
+                <div className="p-6">
+                  {llmLogError && (
+                    <div className="mb-3 bg-amber-50 border border-amber-200 text-amber-800 rounded-lg p-3 text-sm">
+                      {llmLogError}
+                    </div>
+                  )}
+                  <pre className="text-xs text-gray-800 whitespace-pre-wrap font-mono bg-gray-50 p-4 rounded border border-gray-200 max-h-80 overflow-auto">
+                    {llmLogText || 'No LLM runtime logs yet.'}
+                  </pre>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-lg shadow border border-gray-200">
+                <div className="px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Verification History</h2>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Click a row to view the full OTA log sent by the client and the LLM's analysis.
+                  </p>
+                </div>
+                <div className="divide-y divide-gray-200">
+                  {llmResults.length === 0 ? (
+                    <div className="px-6 py-8 text-center text-gray-500">
+                      No LLM verification results yet. Trigger an OTA update with LLM verification enabled.
+                    </div>
+                  ) : (
+                    llmResults.map((r) => {
+                      const isExpanded = llmExpandedId === r.id;
+                      return (
+                        <div key={r.id} className="hover:bg-gray-50">
+                          <button
+                            type="button"
+                            onClick={() => setLlmExpandedId(isExpanded ? null : r.id)}
+                            className="w-full text-left px-6 py-4"
+                          >
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-3">
+                                {isExpanded ? (
+                                  <ChevronDown className="w-4 h-4 text-gray-400" />
+                                ) : (
+                                  <ChevronRight className="w-4 h-4 text-gray-400" />
+                                )}
+                                <span
+                                  className={`px-3 py-1 text-sm font-bold rounded-full ${
+                                    r.decision === 'APPROVE'
+                                      ? 'bg-green-100 text-green-800'
+                                      : 'bg-red-100 text-red-800'
+                                  }`}
+                                >
+                                  {r.decision === 'APPROVE' ? (
+                                    <span className="flex items-center gap-1">
+                                      <ShieldCheck className="w-3.5 h-3.5" /> APPROVE
+                                    </span>
+                                  ) : (
+                                    <span className="flex items-center gap-1">
+                                      <ShieldX className="w-3.5 h-3.5" /> REJECT
+                                    </span>
+                                  )}
+                                </span>
+                                <span className="text-sm font-medium text-gray-900">{r.vehicle_id || 'unknown'}</span>
+                                <span className="text-sm text-gray-500">
+                                  {r.current_version || '?'} → {r.new_version || '?'}
+                                </span>
+                              </div>
+                              <span className="text-xs text-gray-500">{formatTime(r.created_at)}</span>
+                            </div>
+                            <p className="mt-2 text-sm text-gray-700 ml-7 line-clamp-2">{r.reason}</p>
+                          </button>
+
+                          {isExpanded && (
+                            <div className="px-6 pb-4 space-y-4">
+                              <div className="ml-7 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                                <h4 className="text-sm font-semibold text-gray-800 mb-2 flex items-center gap-2">
+                                  <Brain className="w-4 h-4 text-purple-600" />
+                                  LLM Analysis
+                                </h4>
+                                <pre className="text-sm text-gray-700 whitespace-pre-wrap font-mono bg-white p-3 rounded border border-gray-200">
+                                  {r.raw_response || r.reason || 'N/A'}
+                                </pre>
+                              </div>
+
+                              {r.ota_log && Object.keys(r.ota_log).length > 0 && (
+                                <div className="ml-7 p-4 bg-blue-50 rounded-lg border border-blue-200">
+                                  <h4 className="text-sm font-semibold text-blue-800 mb-2">Client OTA Log</h4>
+                                  <pre className="text-xs text-blue-900 whitespace-pre-wrap font-mono bg-white p-3 rounded border border-blue-200 max-h-96 overflow-auto">
+                                    {JSON.stringify(r.ota_log, null, 2)}
+                                  </pre>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             </div>
