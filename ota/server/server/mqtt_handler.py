@@ -6,7 +6,7 @@ import json
 import logging
 import threading
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 import paho.mqtt.client as mqtt
 
@@ -20,12 +20,13 @@ logger = logging.getLogger(__name__)
 class MQTTHandler:
     """MQTT 메시지 처리 핸들러"""
     
-    def __init__(self, app_context):
+    def __init__(self, app_context, on_llm_decision: Optional[Callable[[str, Dict[str, Any]], None]] = None):
         """
         Args:
             app_context: Flask 애플리케이션 컨텍스트
         """
         self.app_context = app_context
+        self.on_llm_decision = on_llm_decision
         self.client: Optional[mqtt.Client] = None
         self.connected = False
         self._lock = threading.Lock()
@@ -107,6 +108,7 @@ class MQTTHandler:
                 ("ota/+/status", Config.MQTT_QOS),
                 ("ota/+/progress", Config.MQTT_QOS),
                 (Config.MQTT_TOPIC_VEHICLE_REGISTER, Config.MQTT_QOS),
+                ("ota/+/llm/decision", Config.MQTT_QOS),  # [LLM-MQTT-BRIDGE]
             ]
             
             for topic, qos in topics:
@@ -144,8 +146,13 @@ class MQTTHandler:
                 self._handle_register_message(data)
                 return
             
-            # 토픽 파싱: ota/<vehicle_id>/<type>
+            # [LLM-MQTT-BRIDGE] 토픽 파싱: ota/<vehicle_id>/llm/decision
             parts = topic.split('/')
+            if len(parts) == 4 and parts[0] == 'ota' and parts[2] == 'llm' and parts[3] == 'decision':
+                self._handle_llm_decision_message(parts[1], data)
+                return
+
+            # 토픽 파싱: ota/<vehicle_id>/<type>
             if len(parts) != 3 or parts[0] != 'ota':
                 logger.warning(f"Invalid topic format: {topic}")
                 return
@@ -163,6 +170,16 @@ class MQTTHandler:
                 
         except Exception as e:
             logger.error(f"Error processing MQTT message: {e}", exc_info=True)
+
+    def _handle_llm_decision_message(self, vehicle_id: str, data: dict):
+        # [LLM-MQTT-BRIDGE] LLM decision payload를 app.py 콜백으로 전달
+        try:
+            if self.on_llm_decision is None:
+                logger.debug("No LLM decision callback configured; ignoring MQTT decision")
+                return
+            self.on_llm_decision(vehicle_id, data if isinstance(data, dict) else {})
+        except Exception as e:
+            logger.error("Error in llm decision message handler: %s", e, exc_info=True)
 
     def _upsert_vehicle(self, vehicle_id: str, default_status: str = 'idle') -> Vehicle:
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()

@@ -264,6 +264,54 @@ def ensure_schema_compatibility():
             conn.execute(text("ALTER TABLE update_history ADD COLUMN client_log_updated_at TIMESTAMP"))
             logger.info("Added missing column: update_history.client_log_updated_at")
 
+
+# [LLM-MQTT-BRIDGE] OTA_LLM -> MQTT decision payload 저장 콜백
+def _handle_mqtt_llm_decision(vehicle_id: str, payload: dict) -> None:
+    try:
+        data = payload if isinstance(payload, dict) else {}
+        decision = str(data.get("decision") or "").strip().upper()
+        if decision not in {"APPROVE", "REJECT"}:
+            logger.warning("Ignoring invalid LLM decision from MQTT: %s", decision or "empty")
+            return
+
+        ota_log = data.get("ota_log")
+        if not isinstance(ota_log, dict):
+            ota_log = data.get("log") if isinstance(data.get("log"), dict) else {}
+        if not ota_log:
+            ota_log = {
+                "device_state": {"vehicle_id": vehicle_id},
+                "firmware_metadata": {
+                    "current_active_version": str(data.get("current_version") or "").strip(),
+                    "new_installed_version": str(data.get("new_version") or data.get("target_version") or "").strip(),
+                },
+            }
+        # [LLM-MQTT-BRIDGE] 최소 필드 보강(vehicle_id/ota_id)
+        device_state = ota_log.get("device_state") if isinstance(ota_log.get("device_state"), dict) else {}
+        if not str(device_state.get("vehicle_id") or "").strip():
+            device_state["vehicle_id"] = vehicle_id
+        ota_log["device_state"] = device_state
+        ota_obj = ota_log.get("ota") if isinstance(ota_log.get("ota"), dict) else {}
+        if not str(ota_obj.get("ota_id") or "").strip():
+            ota_id = str(data.get("ota_id") or "").strip()
+            if ota_id:
+                ota_obj["ota_id"] = ota_id
+        if ota_obj:
+            ota_log["ota"] = ota_obj
+
+        result = {
+            "request_id": str(data.get("request_id") or "").strip(),
+            "decision": decision,
+            "reason": str(data.get("reason") or "No reason").strip() or "No reason",
+            "raw_response": str(data.get("raw_response") or data.get("raw_model_output") or "").strip(),
+            "source": str(data.get("source") or "mqtt_llm_bridge").strip() or "mqtt_llm_bridge",
+            "analyzed_at": str(data.get("analyzed_at") or "").strip(),
+        }
+        save_verification_result(ota_log, result)
+        logger.info("Saved LLM decision from MQTT vehicle=%s decision=%s", vehicle_id, decision)
+    except Exception as exc:
+        logger.error("Failed to save LLM decision from MQTT: %s", exc, exc_info=True)
+
+
 def init_mqtt():
     """MQTT 핸들러 초기화"""
     global mqtt_handler
@@ -276,7 +324,10 @@ def init_mqtt():
             except Exception:
                 pass
         with app.app_context():
-            mqtt_handler = MQTTHandler(app.app_context)
+            mqtt_handler = MQTTHandler(
+                app.app_context,
+                on_llm_decision=_handle_mqtt_llm_decision,  # [LLM-MQTT-BRIDGE]
+            )
             mqtt_handler.connect()
             logger.info("MQTT handler initialized and connected")
     except Exception as e:
