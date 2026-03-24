@@ -312,6 +312,62 @@ def _handle_mqtt_llm_decision(vehicle_id: str, payload: dict) -> None:
         logger.error("Failed to save LLM decision from MQTT: %s", exc, exc_info=True)
 
 
+def _handle_mqtt_update_request(vehicle_id: str, payload: dict) -> None:
+    """
+    차량이 register(trigger=ui_update_request)로 업데이트 요청 시
+    기존 trigger-update 로직을 재사용해 cmd 토픽을 발행한다.
+    """
+    try:
+        data = payload if isinstance(payload, dict) else {}
+        trigger = str(data.get("trigger") or "").strip().lower()
+        if trigger not in {"ui_update_request", "update_request", "request_update"}:
+            return
+
+        target_version = str(data.get("version") or data.get("target_version") or "").strip()
+        force_trigger = parse_bool(data.get("force"), default=False)
+
+        req_payload = {"vehicle_id": vehicle_id}
+        if target_version:
+            req_payload["version"] = target_version
+        if force_trigger:
+            req_payload["force"] = True
+
+        # request context가 없는 MQTT 콜백에서도 기존 trigger_update() 로직을 그대로 재사용.
+        base_url = str(Config.FIRMWARE_BASE_URL or "").strip() or f"http://127.0.0.1:{Config.PORT}"
+        with app.test_request_context(
+            '/api/v1/admin/trigger-update',
+            method='POST',
+            json=req_payload,
+            base_url=base_url,
+        ):
+            result = trigger_update()
+
+        response = result[0] if isinstance(result, tuple) else result
+        status_code = int(result[1]) if isinstance(result, tuple) else int(getattr(response, "status_code", 500))
+        body = response.get_json(silent=True) if hasattr(response, "get_json") else {}
+        if not isinstance(body, dict):
+            body = {}
+
+        if 200 <= status_code < 300:
+            logger.info(
+                "Handled MQTT register update-request: vehicle_id=%s version=%s cmd_topic=%s transport=%s",
+                vehicle_id,
+                target_version or "-",
+                body.get("cmd_topic") or _format_cmd_topic(vehicle_id),
+                body.get("transport") or "-",
+            )
+        else:
+            logger.warning(
+                "Failed MQTT register update-request: vehicle_id=%s version=%s status=%s error=%s",
+                vehicle_id,
+                target_version or "-",
+                status_code,
+                body.get("error") or body.get("detail") or "unknown",
+            )
+    except Exception as exc:
+        logger.error("Error handling MQTT register update-request vehicle_id=%s: %s", vehicle_id, exc, exc_info=True)
+
+
 def init_mqtt():
     """MQTT 핸들러 초기화"""
     global mqtt_handler
@@ -327,6 +383,7 @@ def init_mqtt():
             mqtt_handler = MQTTHandler(
                 app.app_context,
                 on_llm_decision=_handle_mqtt_llm_decision,  # [LLM-MQTT-BRIDGE]
+                on_update_request=_handle_mqtt_update_request,
             )
             mqtt_handler.connect()
             logger.info("MQTT handler initialized and connected")
@@ -1274,6 +1331,37 @@ def upload_firmware():
 
         db.session.commit()
 
+        announce_topic = str(Config.MQTT_TOPIC_RELEASE_ANNOUNCE or '').strip()
+        announce_release_id = f"fw-{firmware.id}-{firmware.version}-{sha256[:12]}"
+        announce_sent = False
+        announce_error = ''
+        if announce_topic:
+            announce_payload = {
+                'ota_id': announce_release_id,
+                'version': firmware.version,
+                'filename': firmware.filename,
+                'url': build_firmware_url(firmware.filename),
+                'sha256': firmware.sha256,
+                'size': int(firmware.file_size or 0),
+            }
+            try:
+                if (mqtt_handler is None) or (not mqtt_handler.is_connected()):
+                    init_mqtt()
+                if mqtt_handler and mqtt_handler.is_connected():
+                    announce_sent = bool(mqtt_handler.publish_release_announcement(announce_payload))
+                    if not announce_sent:
+                        announce_error = 'publish failed'
+                else:
+                    announce_error = 'mqtt not connected'
+            except Exception as announce_ex:
+                announce_error = f"{announce_ex.__class__.__name__}: {announce_ex}"
+                logger.warning(
+                    "Failed to publish firmware release announcement version=%s: %s",
+                    firmware.version,
+                    announce_ex,
+                    exc_info=True,
+                )
+
         total_sec = time.monotonic() - started_at
         logger.info(
             "Firmware upload timing: version=%s file=%s size_mib=%.1f save_hash_sec=%.2f total_sec=%.2f",
@@ -1287,7 +1375,13 @@ def upload_firmware():
         return jsonify({
             'success': True,
             'updated': bool(existing_firmware),
-            'firmware': firmware.to_dict()
+            'firmware': firmware.to_dict(),
+            'release_announcement': {
+                'topic': announce_topic,
+                'release_id': announce_release_id,
+                'published': announce_sent,
+                'error': announce_error or None,
+            },
         }), status_code
 
     except IntegrityError:

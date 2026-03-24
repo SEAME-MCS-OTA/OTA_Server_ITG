@@ -20,13 +20,19 @@ logger = logging.getLogger(__name__)
 class MQTTHandler:
     """MQTT 메시지 처리 핸들러"""
     
-    def __init__(self, app_context, on_llm_decision: Optional[Callable[[str, Dict[str, Any]], None]] = None):
+    def __init__(
+        self,
+        app_context,
+        on_llm_decision: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+        on_update_request: Optional[Callable[[str, Dict[str, Any]], None]] = None,
+    ):
         """
         Args:
             app_context: Flask 애플리케이션 컨텍스트
         """
         self.app_context = app_context
         self.on_llm_decision = on_llm_decision
+        self.on_update_request = on_update_request
         self.client: Optional[mqtt.Client] = None
         self.connected = False
         self._lock = threading.Lock()
@@ -180,6 +186,15 @@ class MQTTHandler:
             self.on_llm_decision(vehicle_id, data if isinstance(data, dict) else {})
         except Exception as e:
             logger.error("Error in llm decision message handler: %s", e, exc_info=True)
+
+    def _handle_update_request_trigger(self, vehicle_id: str, data: dict):
+        try:
+            if self.on_update_request is None:
+                logger.debug("No update-request callback configured; ignoring register trigger")
+                return
+            self.on_update_request(vehicle_id, data if isinstance(data, dict) else {})
+        except Exception as e:
+            logger.error("Error in update-request trigger handler: %s", e, exc_info=True)
 
     def _upsert_vehicle(self, vehicle_id: str, default_status: str = 'idle') -> Vehicle:
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
@@ -398,6 +413,17 @@ class MQTTHandler:
                         ip_addr or "-",
                         current_version or "-",
                     )
+
+                    trigger = str(data.get("trigger") or "").strip().lower()
+                    if trigger in {"ui_update_request", "update_request", "request_update"}:
+                        logger.info(
+                            "Received register update-request trigger: vehicle_id=%s trigger=%s version=%s release_id=%s",
+                            vehicle_id,
+                            trigger,
+                            str(data.get("version") or data.get("target_version") or "").strip() or "-",
+                            str(data.get("release_id") or data.get("ota_id") or "").strip() or "-",
+                        )
+                        self._handle_update_request_trigger(vehicle_id, data)
                 except Exception as e:
                     db.session.rollback()
                     logger.error(f"Database error in register handler: {e}", exc_info=True)
