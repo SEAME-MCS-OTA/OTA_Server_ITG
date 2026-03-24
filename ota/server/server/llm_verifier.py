@@ -1,250 +1,268 @@
 """
-Minimal LLM verifier/storage helpers.
-
-NOTE:
-- This is intentionally lightweight so server/runtime endpoints work.
-- It provides the interface expected by app.py:
-  preprocess_log, call_llm_verification, save_verification_result,
-  get_llm_log_path, _get_verification_db
+OTA LLM 2차 검증 모듈
+Claude API를 호출하여 OTA 업데이트 로그의 보안 이상징후를 탐지한다.
 """
-
-from __future__ import annotations
-
 import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timezone
-from typing import Any, Dict, Tuple
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from typing import Optional
 
-from config import Config
+try:
+    import anthropic
+except ImportError:  # pragma: no cover - runtime dependency may be intentionally absent
+    anthropic = None
 
 logger = logging.getLogger(__name__)
 
+_LLM_LOG_PATH = os.getenv(
+    "LLM_LOG_PATH",
+    os.path.join(os.path.dirname(__file__), "logs", "llm-verifier.log"),
+)
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+
+def _configure_llm_file_logger() -> None:
+    if any(getattr(handler, "baseFilename", None) == os.path.abspath(_LLM_LOG_PATH) for handler in logger.handlers):
+        return
+
+    llm_log_dir = os.path.dirname(_LLM_LOG_PATH)
+    if llm_log_dir:
+        os.makedirs(llm_log_dir, exist_ok=True)
+
+    handler = RotatingFileHandler(
+        _LLM_LOG_PATH,
+        maxBytes=2 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
+    logger.propagate = True
 
 
 def get_llm_log_path() -> str:
-    return str(getattr(Config, "LLM_LOG_PATH", "./logs/llm-verifier.log") or "./logs/llm-verifier.log")
+    return _LLM_LOG_PATH
 
 
-def _get_verification_db_path() -> str:
-    env_path = str(os.getenv("LLM_RESULTS_DB_PATH", "") or "").strip()
-    if env_path:
-        return env_path
-    log_path = get_llm_log_path()
-    base_dir = os.path.dirname(log_path) or "."
-    return os.path.join(base_dir, "llm-verification.db")
+_configure_llm_file_logger()
+
+# ──────────────────────────────────────────────
+# 시스템 프롬프트
+# ──────────────────────────────────────────────
+
+SYSTEM_PROMPT = """너는 차량 OTA(Over-the-Air) 업데이트 보안 분석 에이전트이다.
+
+아래에 제공되는 OTA 업데이트 로그(JSON)를 분석하여 보안 이상징후를 탐지하라.
+
+## 판단 기준
+
+다음 항목 중 하나라도 해당되면 REJECT 판정을 내려라:
+
+1. 버전 다운그레이드: new_installed_version이 current_active_version보다 낮은 경우
+2. 파일 사이즈 이상: firmware_file_size_bytes와 expected_file_size_bytes 간 차이가 10% 이상인 경우
+3. 비정상 배포 경로: update_trigger_server 또는 build_server_info가 알려진 정상 서버 목록에 없는 경우
+4. 비정상 업데이트 빈도: recent_update_history를 기반으로 최근 24시간 내 3회 이상 업데이트 시도가 있는 경우
+5. 비정상 MQTT 패턴: 짧은 시간 내 동일 명령 반복 수신 (10분 이내 3회 이상)
+6. RAUC 설치 과정 이상: exit code가 0이 아니거나, 로그에 error/warning이 다수 포함된 경우
+7. 시스템 리소스 이상: CPU 또는 메모리 사용률이 비정상적으로 높은 상태 (90% 이상)에서 업데이트 수행
+8. 복합 이상 패턴: 개별 항목은 정상 범위이나, 여러 항목을 종합했을 때 의심스러운 패턴
+
+## 출력 형식
+
+반드시 첫 번째 줄에 판정 결과만 출력하라: APPROVE 또는 REJECT
+두 번째 줄부터 판단 근거를 간결하게 설명하라.
+
+예시:
+REJECT
+버전 다운그레이드 탐지: 현재 활성 버전 1.0.0에서 0.8.0으로 다운그레이드 시도. 롤백 공격 가능성이 있음."""
 
 
-def _ensure_parent_dir(path: str) -> None:
-    parent = os.path.dirname(str(path or "").strip())
-    if parent and (not os.path.exists(parent)):
-        os.makedirs(parent, exist_ok=True)
+# ──────────────────────────────────────────────
+# Claude API 호출
+# ──────────────────────────────────────────────
 
+def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-20250514") -> dict:
+    """
+    OTA 로그를 Claude API에 전송하여 검증 결과를 받는다.
 
-def _append_runtime_log(message: str) -> None:
-    path = get_llm_log_path()
-    _ensure_parent_dir(path)
-    line = f"{_utc_now_iso()} {message}\n"
+    Args:
+        ota_log_json: 클라이언트에서 수신한 OTA 로그 JSON
+        model: 사용할 Claude 모델 ID
+
+    Returns:
+        {
+            "decision": "APPROVE" or "REJECT",
+            "reason": "판단 근거",
+            "raw_response": "LLM 원본 응답"
+        }
+    """
     try:
-        with open(path, "a", encoding="utf-8") as fp:
-            fp.write(line)
-    except Exception as exc:
-        logger.warning("Failed to append llm runtime log: %s", exc)
+        vehicle_id = ota_log_json.get("device_state", {}).get("vehicle_id", "unknown")
+        current_version = ota_log_json.get("firmware_metadata", {}).get("current_active_version", "")
+        new_version = ota_log_json.get("firmware_metadata", {}).get("new_installed_version", "")
+        logger.info(
+            "LLM verification start vehicle=%s current=%s target=%s model=%s",
+            vehicle_id,
+            current_version,
+            new_version,
+            model,
+        )
+        if anthropic is None:
+            logger.error("Anthropic SDK is not installed; rejecting LLM verification request")
+            return {
+                "decision": "REJECT",
+                "reason": "Anthropic SDK not installed on server. Fail-safe 정책에 따라 업데이트 거부.",
+                "raw_response": None,
+            }
+
+        client = anthropic.Anthropic()
+
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        "다음 OTA 업데이트 로그를 분석하여 보안 이상징후를 판단하라:\n\n"
+                        f"{json.dumps(ota_log_json, indent=2, ensure_ascii=False)}"
+                    )
+                }
+            ]
+        )
+
+        result_text = response.content[0].text
+        lines = result_text.strip().split('\n')
+        decision = lines[0].strip().upper()
+        reason = '\n'.join(lines[1:]).strip()
+
+        # APPROVE/REJECT 외의 응답은 안전하게 REJECT 처리
+        if decision not in ("APPROVE", "REJECT"):
+            decision = "REJECT"
+            reason = f"LLM 응답 파싱 불가. 원본: {result_text[:200]}"
+
+        logger.info(
+            "LLM verification done vehicle=%s decision=%s reason=%s",
+            vehicle_id,
+            decision,
+            (reason or "")[:200],
+        )
+
+        return {
+            "decision": decision,
+            "reason": reason,
+            "raw_response": result_text,
+        }
+
+    except anthropic.APITimeoutError:
+        logger.error("Claude API timeout")
+        return {
+            "decision": "REJECT",
+            "reason": "Claude API 타임아웃. Fail-safe 정책에 따라 업데이트 거부.",
+            "raw_response": None,
+        }
+
+    except Exception as e:
+        logger.error(f"LLM verification error: {e}")
+        return {
+            "decision": "REJECT",
+            "reason": f"LLM 검증 중 예외 발생: {str(e)}. Fail-safe 정책에 따라 업데이트 거부.",
+            "raw_response": None,
+        }
+
+
+# ──────────────────────────────────────────────
+# 로그 전처리
+# ──────────────────────────────────────────────
+
+def preprocess_log(ota_log: dict) -> dict:
+    """
+    LLM에 전송하기 전 로그를 전처리한다.
+    - RAUC 로그가 너무 길면 에러/워닝만 추출
+    - 토큰 절약을 위해 불필요 필드 축약
+    """
+    processed = json.loads(json.dumps(ota_log))  # deep copy
+
+    # RAUC 로그 요약
+    rauc_log = processed.get("process_log", {}).get("rauc_install_log_summary", "")
+    if len(rauc_log) > 2000:
+        lines = rauc_log.split('\n')
+        important_lines = [
+            l for l in lines
+            if any(kw in l.lower() for kw in ['error', 'warning', 'fail', 'denied'])
+        ]
+        if important_lines:
+            processed["process_log"]["rauc_install_log_summary"] = '\n'.join(important_lines)
+        else:
+            processed["process_log"]["rauc_install_log_summary"] = (
+                "Installation completed without notable errors. (Log truncated for brevity)"
+            )
+
+    return processed
+
+
+# ──────────────────────────────────────────────
+# 검증 결과 DB 저장 (SQLite)
+# ──────────────────────────────────────────────
+
+_VERIFICATION_DB_PATH = os.getenv(
+    "LLM_VERIFICATION_DB",
+    os.path.join(os.path.dirname(__file__), "llm_verification.db"),
+)
 
 
 def _get_verification_db() -> sqlite3.Connection:
-    db_path = _get_verification_db_path()
-    _ensure_parent_dir(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        """
+    """SQLite 연결을 반환하고, 테이블이 없으면 생성한다."""
+    conn = sqlite3.connect(_VERIFICATION_DB_PATH)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS verification_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id TEXT,
             vehicle_id TEXT,
-            ota_id TEXT,
             current_version TEXT,
             new_version TEXT,
             decision TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            source TEXT,
+            reason TEXT,
             raw_response TEXT,
             ota_log_json TEXT,
-            analyzed_at TEXT,
             created_at TEXT NOT NULL
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_verification_results_created_at
-        ON verification_results(created_at DESC)
-        """
-    )
+    """)
     conn.commit()
     return conn
 
 
-def preprocess_log(ota_log: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(ota_log, dict):
-        raise TypeError("ota_log must be JSON object")
-    return ota_log
-
-
-def _is_passed(text: Any) -> bool:
-    value = str(text or "").strip().upper()
-    return value in {"", "PASS", "PASSED", "OK", "SUCCESS"}
-
-
-def call_llm_verification(preprocessed: Dict[str, Any], model: str | None = None) -> Dict[str, Any]:
-    # [MIN-LLM] Simple deterministic fallback rule-set.
-    fw = preprocessed.get("firmware_metadata") if isinstance(preprocessed.get("firmware_metadata"), dict) else {}
-    process_log = preprocessed.get("process_log") if isinstance(preprocessed.get("process_log"), dict) else {}
-    error_obj = preprocessed.get("error") if isinstance(preprocessed.get("error"), dict) else {}
-
-    reasons = []
-    if not _is_passed(fw.get("signature_verification")):
-        reasons.append(f"signature_verification={fw.get('signature_verification')}")
-    if not _is_passed(process_log.get("integrity_check_result")):
-        reasons.append(f"integrity_check_result={process_log.get('integrity_check_result')}")
-    exit_code = process_log.get("rauc_install_exit_code")
-    if exit_code not in (None, "", 0, "0"):
-        reasons.append(f"rauc_install_exit_code={exit_code}")
-    if str(error_obj.get("code") or "").strip():
-        reasons.append(f"error_code={error_obj.get('code')}")
-
-    if reasons:
-        decision = "REJECT"
-        reason = "Fail-safe decision by minimal verifier: " + ", ".join(reasons)
-    else:
-        decision = "APPROVE"
-        reason = "Minimal verifier approved: no explicit failure signals in payload."
-
-    used_model = str(model or getattr(Config, "LLM_MODEL", "minimal-fallback")).strip() or "minimal-fallback"
-    raw = f"{decision}\n{reason}\nmodel={used_model}"
-    _append_runtime_log(f"verify decision={decision} model={used_model} reason={reason}")
-    return {
-        "decision": decision,
-        "reason": reason,
-        "raw_response": raw,
-        "model": used_model,
-    }
-
-
-def _extract_vehicle_id(ota_log: Dict[str, Any]) -> str:
-    if not isinstance(ota_log, dict):
-        return "unknown"
-    for candidate in (
-        ota_log.get("vehicle_id"),
-        ((ota_log.get("device_state") or {}).get("vehicle_id") if isinstance(ota_log.get("device_state"), dict) else None),
-        ((ota_log.get("device") or {}).get("device_id") if isinstance(ota_log.get("device"), dict) else None),
-    ):
-        text = str(candidate or "").strip()
-        if text:
-            return text
-    return "unknown"
-
-
-def _extract_ota_id(ota_log: Dict[str, Any]) -> str:
-    if not isinstance(ota_log, dict):
-        return ""
-    for candidate in (
-        ota_log.get("ota_id"),
-        ((ota_log.get("ota") or {}).get("ota_id") if isinstance(ota_log.get("ota"), dict) else None),
-    ):
-        text = str(candidate or "").strip()
-        if text:
-            return text
-    return ""
-
-
-def _extract_versions(ota_log: Dict[str, Any]) -> Tuple[str, str]:
-    current_version = ""
-    new_version = ""
-    if not isinstance(ota_log, dict):
-        return current_version, new_version
-
-    fw = ota_log.get("firmware_metadata")
-    if isinstance(fw, dict):
-        current_version = str(
-            fw.get("current_active_version")
-            or fw.get("current_version")
-            or fw.get("from_version")
-            or ""
-        ).strip()
-        new_version = str(
-            fw.get("new_installed_version")
-            or fw.get("target_version")
-            or fw.get("new_version")
-            or ""
-        ).strip()
-
-    ota = ota_log.get("ota")
-    if isinstance(ota, dict):
-        if not current_version:
-            current_version = str(ota.get("current_version") or "").strip()
-        if not new_version:
-            new_version = str(ota.get("target_version") or ota.get("new_version") or "").strip()
-
-    return current_version, new_version
-
-
-def save_verification_result(ota_log: Dict[str, Any], result: Dict[str, Any]) -> int:
-    if not isinstance(ota_log, dict):
-        ota_log = {}
-    if not isinstance(result, dict):
-        result = {}
-
-    decision = str(result.get("decision") or "REJECT").strip().upper()
-    if decision not in {"APPROVE", "REJECT"}:
-        decision = "REJECT"
-
-    reason = str(result.get("reason") or "No reason").strip() or "No reason"
-    raw_response = str(result.get("raw_response") or result.get("raw_model_output") or "").strip()
-    source = str(result.get("source") or "llm_verifier").strip() or "llm_verifier"
-
-    current_version, new_version = _extract_versions(ota_log)
-    vehicle_id = _extract_vehicle_id(ota_log)
-    ota_id = _extract_ota_id(ota_log)
-    analyzed_at = str(result.get("analyzed_at") or _utc_now_iso()).strip()
-    created_at = _utc_now_iso()
-
-    conn = _get_verification_db()
+def save_verification_result(ota_log: dict, result: dict):
+    """검증 결과를 SQLite DB에 저장한다."""
     try:
-        cur = conn.execute(
-            """
-            INSERT INTO verification_results (
-                request_id, vehicle_id, ota_id, current_version, new_version,
-                decision, reason, source, raw_response, ota_log_json, analyzed_at, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
+        conn = _get_verification_db()
+        vehicle_id = ota_log.get("device_state", {}).get("vehicle_id", "unknown")
+        current_version = ota_log.get("firmware_metadata", {}).get("current_active_version", "")
+        new_version = ota_log.get("firmware_metadata", {}).get("new_installed_version", "")
+
+        conn.execute(
+            """INSERT INTO verification_results
+               (vehicle_id, current_version, new_version, decision, reason, raw_response, ota_log_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                str(result.get("request_id") or "").strip(),
                 vehicle_id,
-                ota_id,
                 current_version,
                 new_version,
-                decision,
-                reason,
-                source,
-                raw_response,
+                result["decision"],
+                result["reason"],
+                result.get("raw_response"),
                 json.dumps(ota_log, ensure_ascii=False),
-                analyzed_at,
-                created_at,
+                datetime.utcnow().isoformat() + "Z",
             ),
         )
         conn.commit()
-        row_id = int(cur.lastrowid or 0)
-    finally:
         conn.close()
-
-    _append_runtime_log(
-        f"saved verification_result id={row_id} vehicle={vehicle_id} decision={decision} source={source}"
-    )
-    return row_id
-
+        logger.info(f"Verification result saved: vehicle={vehicle_id} decision={result['decision']}")
+    except Exception as e:
+        logger.error(f"Failed to save verification result: {e}")

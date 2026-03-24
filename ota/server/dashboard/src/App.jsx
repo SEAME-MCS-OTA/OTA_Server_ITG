@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   RefreshCw,
   Server,
@@ -28,9 +28,7 @@ const MONITORING_API_BASE_URL =
   import.meta.env.VITE_VLM_API_URL ||
   `${window.location.protocol}//${window.location.hostname}:4000`;
 
-const OPERATIONS_REFRESH_INTERVAL = 10000;
-const MONITORING_REFRESH_INTERVAL = 30000;
-const LLM_REFRESH_INTERVAL = 30000;
+const REFRESH_INTERVAL = 5000;
 const ONLINE_WINDOW_SEC = 60;
 
 const OTADashboard = () => {
@@ -69,7 +67,6 @@ const OTADashboard = () => {
   const [llmLogError, setLlmLogError] = useState('');
 
   const [lastUpdate, setLastUpdate] = useState(new Date());
-  const refreshInFlightRef = useRef(false);
 
   const fetchJsonOrThrow = async (url) => {
     const res = await fetch(url);
@@ -189,55 +186,21 @@ const OTADashboard = () => {
     }
   };
 
-  const fetchAllData = async ({ includeAllTabs = false } = {}) => {
-    if (refreshInFlightRef.current) {
-      return;
-    }
-
-    refreshInFlightRef.current = true;
-    try {
-      const jobs = [fetchOperationsData()];
-      if (includeAllTabs || activeTab === 'monitoring') {
-        jobs.push(fetchMonitoringData());
-      }
-      if (includeAllTabs || activeTab === 'llm') {
-        jobs.push(fetchLlmData());
-      }
-      await Promise.allSettled(jobs);
-      setLastUpdate(new Date());
-    } finally {
-      refreshInFlightRef.current = false;
-    }
+  const fetchAllData = async () => {
+    await Promise.allSettled([fetchOperationsData(), fetchMonitoringData(), fetchLlmData()]);
+    setLastUpdate(new Date());
   };
 
   useEffect(() => {
-    const intervalMs =
-      activeTab === 'monitoring'
-        ? MONITORING_REFRESH_INTERVAL
-        : activeTab === 'llm'
-          ? LLM_REFRESH_INTERVAL
-          : OPERATIONS_REFRESH_INTERVAL;
-
     const tick = () => {
-      if (!uploading && !document.hidden) {
-        fetchAllData({ includeAllTabs: false });
+      if (!uploading) {
+        fetchAllData();
       }
     };
-
-    const onVisibilityChange = () => {
-      if (!document.hidden && !uploading) {
-        fetchAllData({ includeAllTabs: false });
-      }
-    };
-
     tick();
-    const interval = setInterval(tick, intervalMs);
-    document.addEventListener('visibilitychange', onVisibilityChange);
-    return () => {
-      clearInterval(interval);
-      document.removeEventListener('visibilitychange', onVisibilityChange);
-    };
-  }, [activeTab, monitoringCity, uploading]);
+    const interval = setInterval(tick, REFRESH_INTERVAL);
+    return () => clearInterval(interval);
+  }, [monitoringCity, uploading]);
 
   const getStatusColor = (status) => {
     const colors = {
@@ -580,7 +543,7 @@ const OTADashboard = () => {
               </div>
 
               <button
-                onClick={() => fetchAllData({ includeAllTabs: true })}
+                onClick={fetchAllData}
                 className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
               >
                 <RefreshCw className="w-4 h-4" />

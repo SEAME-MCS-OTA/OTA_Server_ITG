@@ -5,8 +5,8 @@ MQTT 브로커와의 통신 및 메시지 처리
 import json
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from datetime import datetime
+from typing import Optional
 
 import paho.mqtt.client as mqtt
 
@@ -17,22 +17,45 @@ from monitoring_reporter import publish_update_result, should_report_final_statu
 logger = logging.getLogger(__name__)
 
 
+def normalize_completed_status_by_version(
+    status: str,
+    prev_version: str,
+    target_version: str,
+    message: str = "",
+) -> tuple[str, str]:
+    """
+    서버 성공 판정 보정:
+    - completed 수신 시, 이전 버전과 target_version이 동일하면 실패로 강등한다.
+    - 비교 기준값이 없는 경우(prev_version empty)는 기존 completed를 유지한다.
+    """
+    status_norm = str(status or "").strip().lower()
+    if status_norm != "completed":
+        return status_norm, str(message or "")
+
+    prev = str(prev_version or "").strip()
+    target = str(target_version or "").strip()
+    msg = str(message or "")
+
+    if not target:
+        reason = "target_version missing"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    if prev and prev == target:
+        reason = f"version unchanged: {prev}"
+        return "failed", f"{msg} | {reason}".strip(" |")
+
+    return "completed", msg
+
+
 class MQTTHandler:
     """MQTT 메시지 처리 핸들러"""
     
-    def __init__(
-        self,
-        app_context,
-        on_llm_decision: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-        on_update_request: Optional[Callable[[str, Dict[str, Any]], None]] = None,
-    ):
+    def __init__(self, app_context):
         """
         Args:
             app_context: Flask 애플리케이션 컨텍스트
         """
         self.app_context = app_context
-        self.on_llm_decision = on_llm_decision
-        self.on_update_request = on_update_request
         self.client: Optional[mqtt.Client] = None
         self.connected = False
         self._lock = threading.Lock()
@@ -48,6 +71,7 @@ class MQTTHandler:
                 "client_id": Config.MQTT_CLIENT_ID,
                 "protocol": mqtt.MQTTv311,
                 "clean_session": True,
+                "transport": Config.MQTT_TRANSPORT,
             }
             callback_api = getattr(mqtt, "CallbackAPIVersion", None)
             if callback_api is not None:
@@ -62,6 +86,24 @@ class MQTTHandler:
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
             self.client.on_message = self._on_message
+
+            if Config.MQTT_TRANSPORT == "websockets":
+                self.client.ws_set_options(path=Config.MQTT_WS_PATH)
+
+            if Config.MQTT_TLS_ENABLED:
+                tls_kwargs = {}
+                if Config.MQTT_CA_CERTS:
+                    tls_kwargs["ca_certs"] = Config.MQTT_CA_CERTS
+                if Config.MQTT_CERTFILE:
+                    tls_kwargs["certfile"] = Config.MQTT_CERTFILE
+                if Config.MQTT_KEYFILE:
+                    tls_kwargs["keyfile"] = Config.MQTT_KEYFILE
+                if tls_kwargs:
+                    self.client.tls_set(**tls_kwargs)
+                else:
+                    self.client.tls_set()
+                if Config.MQTT_TLS_INSECURE:
+                    self.client.tls_insecure_set(True)
             
             # 인증 설정 (있는 경우)
             if Config.MQTT_USERNAME and Config.MQTT_PASSWORD:
@@ -70,7 +112,12 @@ class MQTTHandler:
                     Config.MQTT_PASSWORD
                 )
             
-            logger.info("MQTT client initialized")
+            logger.info(
+                "MQTT client initialized transport=%s ws_path=%s tls=%s",
+                Config.MQTT_TRANSPORT,
+                Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == "websockets" else "-",
+                "on" if Config.MQTT_TLS_ENABLED else "off",
+            )
             
         except Exception as e:
             logger.error(f"Failed to initialize MQTT client: {e}")
@@ -109,12 +156,11 @@ class MQTTHandler:
             self.connected = True
             logger.info("Successfully connected to MQTT broker")
             
-            # OTA 상태/진행 + 차량 등록 토픽 구독
+            # 모든 차량의 status/progress 토픽 구독
+            # 와일드카드 사용: ota/+/status, ota/+/progress
             topics = [
                 ("ota/+/status", Config.MQTT_QOS),
                 ("ota/+/progress", Config.MQTT_QOS),
-                (Config.MQTT_TOPIC_VEHICLE_REGISTER, Config.MQTT_QOS),
-                ("ota/+/llm/decision", Config.MQTT_QOS),  # [LLM-MQTT-BRIDGE]
             ]
             
             for topic, qos in topics:
@@ -139,32 +185,22 @@ class MQTTHandler:
             payload = msg.payload.decode('utf-8')
             
             logger.info(f"Received message on topic '{topic}': {payload}")
-
-            # JSON 파싱
-            try:
-                data = json.loads(payload)  # JSON 문자열 → Python 객체(dict)
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON payload: {e}")
-                return
-
-            # Register 토픽은 일반 ota/<vehicle_id>/<type> 포맷이 아니어도 처리
-            if topic == Config.MQTT_TOPIC_VEHICLE_REGISTER:
-                self._handle_register_message(data)
-                return
             
-            # [LLM-MQTT-BRIDGE] 토픽 파싱: ota/<vehicle_id>/llm/decision
-            parts = topic.split('/')
-            if len(parts) == 4 and parts[0] == 'ota' and parts[2] == 'llm' and parts[3] == 'decision':
-                self._handle_llm_decision_message(parts[1], data)
-                return
-
             # 토픽 파싱: ota/<vehicle_id>/<type>
+            parts = topic.split('/')
             if len(parts) != 3 or parts[0] != 'ota':
                 logger.warning(f"Invalid topic format: {topic}")
                 return
             
             vehicle_id = parts[1]
             msg_type = parts[2]  # status or progress
+            
+            # JSON 파싱
+            try:
+                data = json.loads(payload) # JSON 문자열 → Python 객체(dict)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON payload: {e}")
+                return
             
             # 메시지 타입별 처리
             if msg_type == 'status':
@@ -177,25 +213,6 @@ class MQTTHandler:
         except Exception as e:
             logger.error(f"Error processing MQTT message: {e}", exc_info=True)
 
-    def _handle_llm_decision_message(self, vehicle_id: str, data: dict):
-        # [LLM-MQTT-BRIDGE] LLM decision payload를 app.py 콜백으로 전달
-        try:
-            if self.on_llm_decision is None:
-                logger.debug("No LLM decision callback configured; ignoring MQTT decision")
-                return
-            self.on_llm_decision(vehicle_id, data if isinstance(data, dict) else {})
-        except Exception as e:
-            logger.error("Error in llm decision message handler: %s", e, exc_info=True)
-
-    def _handle_update_request_trigger(self, vehicle_id: str, data: dict):
-        try:
-            if self.on_update_request is None:
-                logger.debug("No update-request callback configured; ignoring register trigger")
-                return
-            self.on_update_request(vehicle_id, data if isinstance(data, dict) else {})
-        except Exception as e:
-            logger.error("Error in update-request trigger handler: %s", e, exc_info=True)
-
     def _upsert_vehicle(self, vehicle_id: str, default_status: str = 'idle') -> Vehicle:
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if vehicle:
@@ -204,231 +221,6 @@ class MQTTHandler:
         db.session.add(vehicle)
         logger.info(f"Registered new vehicle from MQTT: {vehicle_id}")
         return vehicle
-
-    @staticmethod
-    def _extract_ip(data: dict) -> Optional[str]:
-        if not isinstance(data, dict):
-            return None
-        for candidate in (
-            data.get("ip"),
-            data.get("ip_address"),
-            ((data.get("context") or {}).get("network") or {}).get("ip"),
-        ):
-            text = str(candidate or "").strip()
-            if text:
-                return text
-        return None
-
-    @staticmethod
-    def _parse_message_timestamp(data: dict) -> Optional[datetime]:
-        if not isinstance(data, dict):
-            return None
-        raw = str(data.get("timestamp") or "").strip()
-        if not raw:
-            return None
-        try:
-            normalized = raw.replace("Z", "+00:00")
-            parsed = datetime.fromisoformat(normalized)
-            if parsed.tzinfo is not None:
-                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-            return parsed
-        except Exception:
-            return None
-
-    @staticmethod
-    def _presence_stale_threshold_sec() -> int:
-        try:
-            return max(30, int(Config.VEHICLE_ONLINE_WINDOW_SEC))
-        except Exception:
-            return 300
-
-    @staticmethod
-    def _in_progress_recovery_timeout_sec(status: str = "") -> int:
-        try:
-            online_window = max(30, int(Config.VEHICLE_ONLINE_WINDOW_SEC))
-        except Exception:
-            online_window = 300
-
-        status_norm = str(status or "").strip().lower()
-        if status_norm == "pending":
-            # A published trigger should transition quickly.
-            # If the device stays idle for over ~90 seconds, the command
-            # likely never started and retriggering should not be blocked.
-            return 90
-        return max(1800, online_window * 6)
-
-    @staticmethod
-    def _is_in_progress_status(status: str) -> bool:
-        return str(status or "").strip().lower() in {"pending", "downloading", "verifying", "installing"}
-
-    @staticmethod
-    def _extract_current_version(data: dict) -> str:
-        if not isinstance(data, dict):
-            return ""
-        for candidate in (
-            data.get("current_version"),
-            ((data.get("ota") or {}).get("current_version")),
-        ):
-            text = str(candidate or "").strip()
-            if text:
-                return text
-        return ""
-
-    @staticmethod
-    def _append_status_note(existing: str, note: str) -> str:
-        base = str(existing or "").strip()
-        extra = str(note or "").strip()
-        if not extra:
-            return base
-        if not base:
-            return extra
-        if extra in base:
-            return base
-        return f"{base} | {extra}"
-
-    def _latest_in_progress_history(self, vehicle_id: str) -> Optional[UpdateHistory]:
-        return (
-            UpdateHistory.query.filter_by(vehicle_id=vehicle_id)
-            .filter(UpdateHistory.status.in_(("pending", "downloading", "verifying", "installing")))
-            .order_by(UpdateHistory.updated_at.desc(), UpdateHistory.started_at.desc())
-            .first()
-        )
-
-    def _should_preserve_in_progress_status(
-        self,
-        vehicle_id: str,
-        prev_status: str,
-        incoming_status: str,
-        reported_version: str = "",
-    ) -> bool:
-        if incoming_status not in {"idle", "offline"}:
-            return False
-        if not self._is_in_progress_status(prev_status):
-            return False
-
-        history = self._latest_in_progress_history(vehicle_id)
-        if history is None:
-            logger.info(
-                "Allowing presence overwrite without active update history: vehicle_id=%s prev=%s new=%s",
-                vehicle_id,
-                prev_status,
-                incoming_status,
-            )
-            return False
-
-        now = datetime.utcnow()
-        last_activity = history.updated_at or history.started_at or now
-        age_sec = max(0.0, (now - last_activity).total_seconds())
-        recovery_timeout_sec = self._in_progress_recovery_timeout_sec(str(history.status or prev_status))
-        if age_sec <= recovery_timeout_sec:
-            logger.info(
-                "Ignoring in-progress presence overwrite: vehicle_id=%s prev=%s new=%s age=%.1fs timeout=%.1fs",
-                vehicle_id,
-                prev_status,
-                incoming_status,
-                age_sec,
-                recovery_timeout_sec,
-            )
-            return True
-
-        recovered_status = "failed"
-        target_version = str(history.target_version or "").strip()
-        if reported_version and target_version and target_version == reported_version:
-            recovered_status = "completed"
-            history.progress = 100
-
-        history.status = recovered_status
-        history.completed_at = now
-        history.message = self._append_status_note(
-            history.message,
-            f"Recovered stale in-progress state via presence={incoming_status} age={age_sec:.1f}s",
-        )
-        logger.warning(
-            "Recovered stale in-progress state: vehicle_id=%s prev=%s new=%s recovered=%s age=%.1fs",
-            vehicle_id,
-            prev_status,
-            incoming_status,
-            recovered_status,
-            age_sec,
-        )
-        return False
-
-    def _handle_register_message(self, data: dict):
-        """
-        Vehicle register 메시지 처리.
-        Payload 예시:
-        {
-          "vehicle_id": "vw-ivi-0026",
-          "current_version": "1.0.2",
-          "ip": "192.168.86.22",
-          "message": "REGISTER_ON_RELEASE"
-        }
-        """
-        try:
-            with self.app_context():
-                try:
-                    vehicle_id = str(data.get("vehicle_id") or data.get("device_id") or "").strip()
-                    if not vehicle_id:
-                        logger.warning("Missing vehicle_id in register message: %s", data)
-                        return
-
-                    current_version = str(data.get("current_version") or "").strip()
-                    status = str(data.get("status") or "idle").strip() or "idle"
-                    ip_addr = self._extract_ip(data)
-                    timestamp = self._parse_message_timestamp(data)
-                    now = datetime.utcnow()
-                    if timestamp is not None:
-                        age_sec = (now - timestamp).total_seconds()
-                        if age_sec > self._presence_stale_threshold_sec():
-                            logger.info(
-                                "Ignoring stale register message: vehicle_id=%s age=%.1fs status=%s",
-                                vehicle_id,
-                                age_sec,
-                                status,
-                            )
-                            return
-
-                    vehicle = self._upsert_vehicle(vehicle_id, default_status=status)
-                    prev_status = str(vehicle.status or "").strip().lower()
-                    if self._should_preserve_in_progress_status(
-                        vehicle_id,
-                        prev_status,
-                        status,
-                        current_version or str(vehicle.current_version or "").strip(),
-                    ):
-                        # Keep recent in-progress state to avoid flicker during live updates.
-                        pass
-                    else:
-                        vehicle.status = status
-                    vehicle.last_seen = now
-                    if current_version:
-                        vehicle.current_version = current_version
-                    if ip_addr:
-                        vehicle.last_ip = ip_addr
-
-                    db.session.commit()
-                    logger.info(
-                        "Vehicle registered from MQTT announce response: %s ip=%s version=%s",
-                        vehicle_id,
-                        ip_addr or "-",
-                        current_version or "-",
-                    )
-
-                    trigger = str(data.get("trigger") or "").strip().lower()
-                    if trigger in {"ui_update_request", "update_request", "request_update"}:
-                        logger.info(
-                            "Received register update-request trigger: vehicle_id=%s trigger=%s version=%s release_id=%s",
-                            vehicle_id,
-                            trigger,
-                            str(data.get("version") or data.get("target_version") or "").strip() or "-",
-                            str(data.get("release_id") or data.get("ota_id") or "").strip() or "-",
-                        )
-                        self._handle_update_request_trigger(vehicle_id, data)
-                except Exception as e:
-                    db.session.rollback()
-                    logger.error(f"Database error in register handler: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Error in register message handler: {e}", exc_info=True)
     
     def _handle_status_message(self, vehicle_id: str, data: dict):
         """
@@ -446,76 +238,37 @@ class MQTTHandler:
             # Flask 애플리케이션 컨텍스트 내에서 DB 작업 수행
             with self.app_context():
                 try:
-                    status = str(data.get('status') or '').strip().lower()
-                    target_version = str(data.get('target_version') or '').strip()
+                    incoming_status = data.get('status')
+                    target_version = data.get('target_version')
                     message = data.get('message', '')
-                    timestamp = self._parse_message_timestamp(data)
-                    now = datetime.utcnow()
-
-                    if not status:
+                    payload_ip = str(
+                        ((data.get('context') or {}).get('network') or {}).get('ip')
+                        or data.get('ip')
+                        or ''
+                    ).strip()
+                    
+                    if not incoming_status or not target_version:
                         logger.warning(f"Missing required fields in status message: {data}")
                         return
-
-                    presence_statuses = {'idle', 'online', 'offline'}
-                    is_presence = status in presence_statuses
-                    if (not is_presence) and (not target_version):
-                        logger.warning(f"Missing target_version in status message: {data}")
-                        return
-
-                    existing_vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
-                    if status == 'offline' and existing_vehicle is None:
-                        # Ignore ghost LWT updates from never-registered devices.
-                        logger.info("Ignoring offline status for unknown vehicle_id=%s", vehicle_id)
-                        return
-
+                    
                     # Vehicle upsert + status 반영
-                    vehicle = existing_vehicle or self._upsert_vehicle(vehicle_id, default_status=status)
+                    vehicle = self._upsert_vehicle(vehicle_id, default_status=incoming_status)
                     prev_version = vehicle.current_version
-                    prev_status = str(vehicle.status or "").strip().lower()
-                    ip_addr = self._extract_ip(data)
-                    reported_version = self._extract_current_version(data)
+                    vehicle.last_seen = datetime.utcnow()
+                    if payload_ip:
+                        vehicle.last_ip = payload_ip
 
-                    if is_presence and timestamp is not None:
-                        age_sec = (now - timestamp).total_seconds()
-                        if age_sec > self._presence_stale_threshold_sec():
-                            logger.info(
-                                "Ignoring stale presence status: vehicle_id=%s status=%s age=%.1fs",
-                                vehicle_id,
-                                status,
-                                age_sec,
-                            )
-                            db.session.commit()
-                            return
+                    status, message = normalize_completed_status_by_version(
+                        incoming_status,
+                        prev_version=str(prev_version or ""),
+                        target_version=str(target_version or ""),
+                        message=message,
+                    )
+                    vehicle.status = status
 
-                    vehicle.last_seen = now
-                    if ip_addr:
-                        vehicle.last_ip = ip_addr
-                    if reported_version:
-                        vehicle.current_version = reported_version
-
-                    if is_presence and self._should_preserve_in_progress_status(
-                        vehicle_id,
-                        prev_status,
-                        status,
-                        reported_version or str(vehicle.current_version or "").strip(),
-                    ):
-                        pass
-                    else:
-                        vehicle.status = status
-
-                    # completed 상태면 current_version 업데이트
-                    if status == 'completed' and target_version:
+                    # 보정 이후 completed 상태일 때만 current_version 업데이트
+                    if status == 'completed':
                         vehicle.current_version = target_version
-
-                    if is_presence:
-                        db.session.commit()
-                        logger.info(
-                            "Updated vehicle %s presence status='%s' (message=%s)",
-                            vehicle_id,
-                            status,
-                            str(message or "").strip() or "-",
-                        )
-                        return
 
                     # UpdateHistory 업데이트
                     history = UpdateHistory.query.filter_by(
@@ -586,6 +339,11 @@ class MQTTHandler:
                     target_version = data.get('target_version')
                     progress = data.get('progress', 0)
                     message = data.get('message', '')
+                    payload_ip = str(
+                        ((data.get('context') or {}).get('network') or {}).get('ip')
+                        or data.get('ip')
+                        or ''
+                    ).strip()
                     
                     if target_version is None:
                         logger.warning(f"Missing target_version in progress message: {data}")
@@ -594,9 +352,8 @@ class MQTTHandler:
                     # Vehicle upsert + heartbeat 갱신
                     vehicle = self._upsert_vehicle(vehicle_id, default_status='downloading')
                     vehicle.last_seen = datetime.utcnow()
-                    ip_addr = self._extract_ip(data)
-                    if ip_addr:
-                        vehicle.last_ip = ip_addr
+                    if payload_ip:
+                        vehicle.last_ip = payload_ip
 
                     # UpdateHistory 업데이트
                     history = UpdateHistory.query.filter_by(
@@ -632,7 +389,7 @@ class MQTTHandler:
         except Exception as e:
             logger.error(f"Error in progress message handler: {e}", exc_info=True)
     
-    def publish_update_command(self, vehicle_id: str, firmware_info: dict, ota_id: Optional[str] = None) -> bool:
+    def publish_update_command(self, vehicle_id: str, firmware_info: dict, ota_id: str = "") -> bool:
         """
         차량에 업데이트 명령 발행
         
@@ -656,13 +413,14 @@ class MQTTHandler:
         
         try:
             topic = Config.MQTT_TOPIC_CMD.format(vehicle_id=vehicle_id)
-            resolved_ota_id = str(ota_id or firmware_info.get("ota_id") or "").strip()
-            payload = json.dumps({
+            payload_obj = {
                 "command": "update",
-                "ota_id": resolved_ota_id,
                 "firmware": firmware_info,
                 "timestamp": datetime.utcnow().isoformat()
-            })
+            }
+            if ota_id:
+                payload_obj["ota_id"] = str(ota_id).strip()
+            payload = json.dumps(payload_obj)
             
             # QoS 2로 발행 (Exactly Once)
             result = self.client.publish(topic, payload, qos=Config.MQTT_QOS)
@@ -671,7 +429,12 @@ class MQTTHandler:
             result.wait_for_publish()
             
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                logger.info(f"Published update command to {vehicle_id}: {firmware_info['version']}")
+                logger.info(
+                    "Published update command to %s: %s ota_id=%s",
+                    vehicle_id,
+                    firmware_info['version'],
+                    ota_id or '-',
+                )
                 return True
             else:
                 logger.error(f"Failed to publish update command: {result.rc}")
@@ -679,44 +442,6 @@ class MQTTHandler:
                 
         except Exception as e:
             logger.error(f"Error publishing update command: {e}", exc_info=True)
-            return False
-
-    def publish_release_announcement(self, firmware_info: dict) -> bool:
-        """
-        업로드된 새 릴리즈를 차량(announce 구독자)에게 브로드캐스트.
-        """
-        if not self.connected:
-            logger.error("Cannot publish release announce: MQTT client not connected")
-            return False
-
-        try:
-            topic = Config.MQTT_TOPIC_RELEASE_ANNOUNCE
-            payload = json.dumps(
-                {
-                    "event": "release_available",
-                    "release_id": str(firmware_info.get("ota_id") or ""),
-                    "version": str(firmware_info.get("version") or ""),
-                    "filename": str(firmware_info.get("filename") or ""),
-                    "url": str(firmware_info.get("url") or ""),
-                    "sha256": str(firmware_info.get("sha256") or ""),
-                    "size": int(firmware_info.get("size") or 0),
-                    "published_at": datetime.utcnow().isoformat(),
-                }
-            )
-            result = self.client.publish(
-                topic,
-                payload,
-                qos=Config.MQTT_QOS,
-                retain=bool(Config.MQTT_ANNOUNCE_RETAIN),
-            )
-            result.wait_for_publish()
-            if result.rc == mqtt.MQTT_ERR_SUCCESS:
-                logger.info("Published release announce: topic=%s version=%s", topic, firmware_info.get("version"))
-                return True
-            logger.error("Failed to publish release announce: rc=%s", result.rc)
-            return False
-        except Exception as e:
-            logger.error("Error publishing release announce: %s", e, exc_info=True)
             return False
     
     def is_connected(self) -> bool:

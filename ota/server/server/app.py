@@ -56,8 +56,6 @@ _mqtt_last_retry_at = 0.0
 _MQTT_RETRY_INTERVAL_SEC = 5.0
 _local_probe_last_at = 0.0
 _local_probe_lock = threading.Lock()
-_runtime_init_lock = threading.Lock()
-_runtime_initialized = False
 
 
 def _parse_local_device_map(raw: str):
@@ -90,14 +88,8 @@ def _parse_local_device_map(raw: str):
 
 
 def _local_endpoint_for_vehicle(vehicle_id: str) -> str:
-    mapping = _parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', ''))
+    mapping = _parse_local_device_map(Config.LOCAL_DEVICE_MAP)
     return str(mapping.get(str(vehicle_id or "").strip(), "")).strip()
-
-
-def _local_probe_enabled() -> bool:
-    if not bool(getattr(Config, 'LOCAL_PROBE_ENABLED', False)):
-        return False
-    return bool(_parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', '')))
 
 
 def _client_ip_from_request() -> str:
@@ -146,8 +138,6 @@ def _phase_event_to_status(phase: str, event: str) -> str:
 def _probe_local_devices_once(force: bool = False):
     """Probe configured local device endpoints and refresh Vehicle heartbeat."""
     global _local_probe_last_at
-    if not _local_probe_enabled():
-        return
     interval = max(1, int(Config.LOCAL_PROBE_INTERVAL_SEC))
     now_mono = time.monotonic()
     if (not force) and (now_mono - _local_probe_last_at) < interval:
@@ -159,7 +149,7 @@ def _probe_local_devices_once(force: bool = False):
             return
         _local_probe_last_at = now_mono
 
-        mapping = _parse_local_device_map(getattr(Config, 'LOCAL_DEVICE_MAP', ''))
+        mapping = _parse_local_device_map(Config.LOCAL_DEVICE_MAP)
         learned = {}
         for vehicle in Vehicle.query.filter(Vehicle.last_ip.isnot(None)).all():
             vehicle_id = str(vehicle.vehicle_id or '').strip()
@@ -264,110 +254,6 @@ def ensure_schema_compatibility():
             conn.execute(text("ALTER TABLE update_history ADD COLUMN client_log_updated_at TIMESTAMP"))
             logger.info("Added missing column: update_history.client_log_updated_at")
 
-
-# [LLM-MQTT-BRIDGE] OTA_LLM -> MQTT decision payload 저장 콜백
-def _handle_mqtt_llm_decision(vehicle_id: str, payload: dict) -> None:
-    try:
-        data = payload if isinstance(payload, dict) else {}
-        decision = str(data.get("decision") or "").strip().upper()
-        if decision not in {"APPROVE", "REJECT"}:
-            logger.warning("Ignoring invalid LLM decision from MQTT: %s", decision or "empty")
-            return
-
-        ota_log = data.get("ota_log")
-        if not isinstance(ota_log, dict):
-            ota_log = data.get("log") if isinstance(data.get("log"), dict) else {}
-        if not ota_log:
-            ota_log = {
-                "device_state": {"vehicle_id": vehicle_id},
-                "firmware_metadata": {
-                    "current_active_version": str(data.get("current_version") or "").strip(),
-                    "new_installed_version": str(data.get("new_version") or data.get("target_version") or "").strip(),
-                },
-            }
-        # [LLM-MQTT-BRIDGE] 최소 필드 보강(vehicle_id/ota_id)
-        device_state = ota_log.get("device_state") if isinstance(ota_log.get("device_state"), dict) else {}
-        if not str(device_state.get("vehicle_id") or "").strip():
-            device_state["vehicle_id"] = vehicle_id
-        ota_log["device_state"] = device_state
-        ota_obj = ota_log.get("ota") if isinstance(ota_log.get("ota"), dict) else {}
-        if not str(ota_obj.get("ota_id") or "").strip():
-            ota_id = str(data.get("ota_id") or "").strip()
-            if ota_id:
-                ota_obj["ota_id"] = ota_id
-        if ota_obj:
-            ota_log["ota"] = ota_obj
-
-        result = {
-            "request_id": str(data.get("request_id") or "").strip(),
-            "decision": decision,
-            "reason": str(data.get("reason") or "No reason").strip() or "No reason",
-            "raw_response": str(data.get("raw_response") or data.get("raw_model_output") or "").strip(),
-            "source": str(data.get("source") or "mqtt_llm_bridge").strip() or "mqtt_llm_bridge",
-            "analyzed_at": str(data.get("analyzed_at") or "").strip(),
-        }
-        save_verification_result(ota_log, result)
-        logger.info("Saved LLM decision from MQTT vehicle=%s decision=%s", vehicle_id, decision)
-    except Exception as exc:
-        logger.error("Failed to save LLM decision from MQTT: %s", exc, exc_info=True)
-
-
-def _handle_mqtt_update_request(vehicle_id: str, payload: dict) -> None:
-    """
-    차량이 register(trigger=ui_update_request)로 업데이트 요청 시
-    기존 trigger-update 로직을 재사용해 cmd 토픽을 발행한다.
-    """
-    try:
-        data = payload if isinstance(payload, dict) else {}
-        trigger = str(data.get("trigger") or "").strip().lower()
-        if trigger not in {"ui_update_request", "update_request", "request_update"}:
-            return
-
-        target_version = str(data.get("version") or data.get("target_version") or "").strip()
-        force_trigger = parse_bool(data.get("force"), default=False)
-
-        req_payload = {"vehicle_id": vehicle_id}
-        if target_version:
-            req_payload["version"] = target_version
-        if force_trigger:
-            req_payload["force"] = True
-
-        # request context가 없는 MQTT 콜백에서도 기존 trigger_update() 로직을 그대로 재사용.
-        base_url = str(Config.FIRMWARE_BASE_URL or "").strip() or f"http://127.0.0.1:{Config.PORT}"
-        with app.test_request_context(
-            '/api/v1/admin/trigger-update',
-            method='POST',
-            json=req_payload,
-            base_url=base_url,
-        ):
-            result = trigger_update()
-
-        response = result[0] if isinstance(result, tuple) else result
-        status_code = int(result[1]) if isinstance(result, tuple) else int(getattr(response, "status_code", 500))
-        body = response.get_json(silent=True) if hasattr(response, "get_json") else {}
-        if not isinstance(body, dict):
-            body = {}
-
-        if 200 <= status_code < 300:
-            logger.info(
-                "Handled MQTT register update-request: vehicle_id=%s version=%s cmd_topic=%s transport=%s",
-                vehicle_id,
-                target_version or "-",
-                body.get("cmd_topic") or _format_cmd_topic(vehicle_id),
-                body.get("transport") or "-",
-            )
-        else:
-            logger.warning(
-                "Failed MQTT register update-request: vehicle_id=%s version=%s status=%s error=%s",
-                vehicle_id,
-                target_version or "-",
-                status_code,
-                body.get("error") or body.get("detail") or "unknown",
-            )
-    except Exception as exc:
-        logger.error("Error handling MQTT register update-request vehicle_id=%s: %s", vehicle_id, exc, exc_info=True)
-
-
 def init_mqtt():
     """MQTT 핸들러 초기화"""
     global mqtt_handler
@@ -380,44 +266,19 @@ def init_mqtt():
             except Exception:
                 pass
         with app.app_context():
-            mqtt_handler = MQTTHandler(
-                app.app_context,
-                on_llm_decision=_handle_mqtt_llm_decision,  # [LLM-MQTT-BRIDGE]
-                on_update_request=_handle_mqtt_update_request,
-            )
+            mqtt_handler = MQTTHandler(app.app_context)
             mqtt_handler.connect()
             logger.info("MQTT handler initialized and connected")
     except Exception as e:
         logger.error(f"Failed to initialize MQTT handler: {e}")
         logger.warning("Server will run without MQTT support")
 
-
-def initialize_server_runtime():
-    """Initialize runtime state once for both WSGI and dev-server entrypoints."""
-    global _runtime_initialized
-    if _runtime_initialized:
-        return
-    with _runtime_init_lock:
-        if _runtime_initialized:
-            return
-        Config.validate()
-        init_db()
-        with app.app_context():
-            _normalize_active_firmware()
-        if _local_probe_enabled():
-            _probe_local_devices_once(force=True)
-        init_mqtt()
-        _runtime_initialized = True
-        logger.info("Server runtime initialized")
-
 @app.before_request
 def before_request():
     """첫 요청 시 MQTT 초기화"""
     global mqtt_handler
     global _mqtt_last_retry_at
-    initialize_server_runtime()
-    if _local_probe_enabled():
-        _probe_local_devices_once(force=False)
+    _probe_local_devices_once(force=False)
     need_init = mqtt_handler is None or not mqtt_handler.is_connected()
     retry_due = (time.monotonic() - _mqtt_last_retry_at) >= _MQTT_RETRY_INTERVAL_SEC
     if need_init and retry_due:
@@ -1331,37 +1192,6 @@ def upload_firmware():
 
         db.session.commit()
 
-        announce_topic = str(Config.MQTT_TOPIC_RELEASE_ANNOUNCE or '').strip()
-        announce_release_id = f"fw-{firmware.id}-{firmware.version}-{sha256[:12]}"
-        announce_sent = False
-        announce_error = ''
-        if announce_topic:
-            announce_payload = {
-                'ota_id': announce_release_id,
-                'version': firmware.version,
-                'filename': firmware.filename,
-                'url': build_firmware_url(firmware.filename),
-                'sha256': firmware.sha256,
-                'size': int(firmware.file_size or 0),
-            }
-            try:
-                if (mqtt_handler is None) or (not mqtt_handler.is_connected()):
-                    init_mqtt()
-                if mqtt_handler and mqtt_handler.is_connected():
-                    announce_sent = bool(mqtt_handler.publish_release_announcement(announce_payload))
-                    if not announce_sent:
-                        announce_error = 'publish failed'
-                else:
-                    announce_error = 'mqtt not connected'
-            except Exception as announce_ex:
-                announce_error = f"{announce_ex.__class__.__name__}: {announce_ex}"
-                logger.warning(
-                    "Failed to publish firmware release announcement version=%s: %s",
-                    firmware.version,
-                    announce_ex,
-                    exc_info=True,
-                )
-
         total_sec = time.monotonic() - started_at
         logger.info(
             "Firmware upload timing: version=%s file=%s size_mib=%.1f save_hash_sec=%.2f total_sec=%.2f",
@@ -1375,13 +1205,7 @@ def upload_firmware():
         return jsonify({
             'success': True,
             'updated': bool(existing_firmware),
-            'firmware': firmware.to_dict(),
-            'release_announcement': {
-                'topic': announce_topic,
-                'release_id': announce_release_id,
-                'published': announce_sent,
-                'error': announce_error or None,
-            },
+            'firmware': firmware.to_dict()
         }), status_code
 
     except IntegrityError:
@@ -1532,8 +1356,7 @@ def trigger_update():
             return jsonify({'error': 'vehicle_id is required'}), 400
         
         vehicle_id = data['vehicle_id']
-        if _local_probe_enabled() and bool(Config.LOCAL_TRIGGER_FIRST):
-            _probe_local_devices_once(force=True)
+        _probe_local_devices_once(force=True)
         target_version = str(data.get('version') or '').strip() or None
         force_trigger = parse_bool(data.get('force'), default=False)
         
@@ -1872,6 +1695,7 @@ def get_llm_logs():
 def list_vehicles():
     """차량 목록 조회"""
     try:
+        _probe_local_devices_once(force=True)
         vehicles = Vehicle.query.order_by(Vehicle.last_seen.desc()).all()
         return jsonify({
             'vehicles': [_serialize_vehicle(v) for v in vehicles],
@@ -1970,8 +1794,17 @@ def shutdown_session(exception=None):
 
 
 if __name__ == '__main__':
-    initialize_server_runtime()
-
+    # 설정 검증
+    Config.validate()
+    
+    # 데이터베이스 초기화
+    init_db()
+    with app.app_context():
+        _normalize_active_firmware()
+    
+    # MQTT 핸들러 초기화
+    init_mqtt()
+    
     # 서버 시작
     logger.info(f"Starting OTA Server on {Config.HOST}:{Config.PORT}")
     app.run(

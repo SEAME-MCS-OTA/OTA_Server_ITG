@@ -15,6 +15,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
+def _env_first(*names: str, default: str = '') -> str:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return str(raw).strip()
+    return str(default).strip()
+
+
+def _env_bool_first(*names: str, default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    return default
+
+
 def _mqtt_transport() -> str:
     raw = str(os.getenv('MQTT_TRANSPORT', 'tcp') or '').strip().lower()
     if raw in {'ws', 'wss', 'websocket', 'websockets'}:
@@ -55,15 +71,21 @@ class Config:
     # 펌웨어 저장 경로
     FIRMWARE_DIR = os.getenv('FIRMWARE_DIR', './firmware_files')
     CLIENT_LOG_DIR = os.getenv('CLIENT_LOG_DIR', './client_logs')
-    COMMAND_SIGNING_ENABLED = _env_bool('COMMAND_SIGNING_ENABLED', default=True)
-    COMMAND_SIGNING_PRIVATE_KEY_PATH = os.getenv(
+    COMMAND_SIGNING_ENABLED = _env_bool_first(
+        'COMMAND_SIGNING_ENABLED',
+        'COMMAND_SIGN_ENABLED',
+        default=True,
+    )
+    COMMAND_SIGNING_PRIVATE_KEY_PATH = _env_first(
         'COMMAND_SIGNING_PRIVATE_KEY_PATH',
-        '',
-    ).strip()
-    COMMAND_SIGNING_KEY_ID = os.getenv(
+        'COMMAND_SIGN_KEY_PATH',
+        default='',
+    )
+    COMMAND_SIGNING_KEY_ID = _env_first(
         'COMMAND_SIGNING_KEY_ID',
-        'ota-ed25519-v1',
-    ).strip()
+        'COMMAND_SIGN_KEY_ID',
+        default='ota-ed25519-v1',
+    )
     
     # MQTT 설정
     MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
