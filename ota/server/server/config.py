@@ -85,6 +85,9 @@ class Config:
     MQTT_TOPIC_CMD = 'ota/{vehicle_id}/cmd'
     MQTT_TOPIC_STATUS = 'ota/{vehicle_id}/status'
     MQTT_TOPIC_PROGRESS = 'ota/{vehicle_id}/progress'
+    MQTT_TOPIC_RELEASE_ANNOUNCE = os.getenv('MQTT_TOPIC_RELEASE_ANNOUNCE', 'ota/releases/announce')
+    MQTT_TOPIC_VEHICLE_REGISTER = os.getenv('MQTT_TOPIC_VEHICLE_REGISTER', 'ota/vehicles/register')
+    MQTT_ANNOUNCE_RETAIN = _env_bool('MQTT_ANNOUNCE_RETAIN', False)
 
     # OTA 결과 관제 서버(OTA_VLM) 연동
     MONITORING_INGEST_URL = os.getenv('MONITORING_INGEST_URL', '').strip()
