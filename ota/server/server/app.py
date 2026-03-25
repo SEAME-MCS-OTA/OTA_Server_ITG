@@ -1754,7 +1754,9 @@ def verify_ota_update():
                 "raw_response": None,
             }
 
-        save_verification_result(ota_log, result)
+        # `/api/ota/verify`는 OTA 실행 제어용 응답만 반환하고,
+        # 대시보드용 LLM 결과 저장은 `/api/v1/client-logs -> ota/llm/request`
+        # 파이프라인에서만 수행한다.
 
         logger.info(
             "OTA verify: vehicle=%s decision=%s llm_enabled=%s",

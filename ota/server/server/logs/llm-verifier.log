@@ -1,0 +1,6 @@
+2026-03-25 13:58:17,182 INFO llm_verifier: Verification result saved: vehicle=vw-ivi-0026 ota_id=ota-20260325124615-vw-ivi-0026 decision=APPROVE
+2026-03-25 13:58:17,183 INFO llm_verifier: Skipped duplicate verification result: vehicle=vw-ivi-0026 ota_id=ota-20260325124615-vw-ivi-0026 current=3.0.2 target=3.0.2 decision=REJECT
+2026-03-25 13:59:41,761 INFO llm_verifier: Verification result saved: vehicle=vw-ivi-0026 ota_id=ota-1 decision=APPROVE
+2026-03-25 13:59:41,762 INFO llm_verifier: Skipped duplicate verification result: vehicle=vw-ivi-0026 ota_id=ota-1 current=3.0.2 target=3.0.2 decision=REJECT
+2026-03-25 13:59:41,832 INFO llm_verifier: Verification result saved: vehicle=vw-ivi-0026 ota_id=ota-1 decision=REJECT
+2026-03-25 13:59:41,855 INFO llm_verifier: Replaced duplicate verification result with richer payload: id=1 vehicle=vw-ivi-0026 ota_id=ota-1 decision=APPROVE
