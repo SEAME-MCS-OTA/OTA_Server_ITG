@@ -285,11 +285,32 @@ def init_mqtt():
 
 
 def _build_llm_decision(req: dict) -> dict:
-    return analyze_llm_request(
+    decision = analyze_llm_request(
         req,
         transport='mqtt',
         llm_enabled_override=bool(_llm_enabled),
     )
+    _persist_llm_analyze_result(req, decision)
+    return decision
+
+
+def _persist_llm_analyze_result(req: dict, decision: dict) -> None:
+    """`/api/v1/llm/analyze` 경로 결과를 기존 LLM 결과 DB 포맷으로 저장."""
+    try:
+        ota_log = req.get('log') if isinstance(req, dict) else {}
+        if not isinstance(ota_log, dict):
+            ota_log = {}
+
+        save_verification_result(
+            ota_log,
+            {
+                'decision': str(decision.get('decision') or 'REJECT'),
+                'reason': str(decision.get('reason') or ''),
+                'raw_response': str(decision.get('raw_model_output') or ''),
+            },
+        )
+    except Exception as ex:
+        logger.warning("Failed to persist LLM analyze result: %s", ex, exc_info=True)
 
 
 def init_llm_mqtt_bridge():
@@ -1659,6 +1680,7 @@ def analyze_llm():
             transport='http',
             llm_enabled_override=bool(_llm_enabled),
         )
+        _persist_llm_analyze_result(req, decision)
     except Exception as exc:
         return jsonify({'error': str(exc)}), 400
 
