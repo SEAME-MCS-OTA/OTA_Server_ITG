@@ -26,6 +26,9 @@ from werkzeug.utils import secure_filename
 
 from config import Config
 from models import db, Vehicle, Firmware, UpdateHistory
+from llm_dashboard import llm_dashboard_bp
+from llm_mqtt_bridge import LLMMQTTBridge
+from llm_service import analyze_request as analyze_llm_request, normalize_request as normalize_llm_request
 from mqtt_handler import MQTTHandler
 from monitoring_reporter import publish_update_result, should_report_final_status
 from llm_verifier import (
@@ -46,6 +49,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 app.config.from_object(Config)
 CORS(app)
+app.register_blueprint(llm_dashboard_bp)
+app.config['LLM_RUNTIME_ENABLED'] = bool(Config.LLM_VERIFICATION_ENABLED)
 
 # 데이터베이스 초기화
 db.init_app(app)
@@ -54,8 +59,13 @@ db.init_app(app)
 mqtt_handler = None
 _mqtt_last_retry_at = 0.0
 _MQTT_RETRY_INTERVAL_SEC = 5.0
+llm_mqtt_bridge = None
+_llm_mqtt_last_retry_at = 0.0
+_LLM_MQTT_RETRY_INTERVAL_SEC = 5.0
 _local_probe_last_at = 0.0
 _local_probe_lock = threading.Lock()
+_runtime_initialized = False
+_runtime_init_lock = threading.Lock()
 
 
 def _parse_local_device_map(raw: str):
@@ -273,16 +283,56 @@ def init_mqtt():
         logger.error(f"Failed to initialize MQTT handler: {e}")
         logger.warning("Server will run without MQTT support")
 
+
+def _build_llm_decision(req: dict) -> dict:
+    return analyze_llm_request(
+        req,
+        transport='mqtt',
+        llm_enabled_override=bool(_llm_enabled),
+    )
+
+
+def init_llm_mqtt_bridge():
+    """OTA_LLM MQTT bridge 초기화."""
+    global llm_mqtt_bridge
+    global _llm_mqtt_last_retry_at
+
+    if not Config.LLM_MQTT_BRIDGE_ENABLED:
+        return
+
+    try:
+        _llm_mqtt_last_retry_at = time.monotonic()
+        if llm_mqtt_bridge:
+            try:
+                llm_mqtt_bridge.stop()
+            except Exception:
+                pass
+        llm_mqtt_bridge = LLMMQTTBridge(on_request=_build_llm_decision)
+        llm_mqtt_bridge.start()
+        logger.info("LLM MQTT bridge initialized")
+    except Exception as e:
+        logger.error("Failed to initialize LLM MQTT bridge: %s", e, exc_info=True)
+        logger.warning("Server will run without LLM MQTT bridge support")
+
 @app.before_request
 def before_request():
     """첫 요청 시 MQTT 초기화"""
     global mqtt_handler
     global _mqtt_last_retry_at
+    global llm_mqtt_bridge
+    global _llm_mqtt_last_retry_at
     _probe_local_devices_once(force=False)
     need_init = mqtt_handler is None or not mqtt_handler.is_connected()
     retry_due = (time.monotonic() - _mqtt_last_retry_at) >= _MQTT_RETRY_INTERVAL_SEC
     if need_init and retry_due:
         init_mqtt()
+    if Config.LLM_MQTT_BRIDGE_ENABLED:
+        llm_need_init = llm_mqtt_bridge is None or not llm_mqtt_bridge.is_connected()
+        llm_retry_due = (
+            time.monotonic() - _llm_mqtt_last_retry_at
+        ) >= _LLM_MQTT_RETRY_INTERVAL_SEC
+        if llm_need_init and llm_retry_due:
+            init_llm_mqtt_bridge()
 
 def compare_versions(v1: str, v2: str) -> int:
     """
@@ -647,6 +697,18 @@ def health_check():
         'mqtt_transport': Config.MQTT_TRANSPORT,
         'mqtt_ws_path': Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == 'websockets' else '',
         'mqtt_tls_enabled': Config.MQTT_TLS_ENABLED,
+    }), 200
+
+
+@app.route('/healthz', methods=['GET'])
+def healthz():
+    """OTA_LLM 호환 헬스체크 엔드포인트."""
+    return jsonify({
+        'status': 'ok',
+        'service': 'ota-server-itg',
+        'mqtt_enabled': bool(Config.LLM_MQTT_BRIDGE_ENABLED),
+        'mqtt_connected': llm_mqtt_bridge.is_connected() if llm_mqtt_bridge else False,
+        'llm_verify': bool(_llm_enabled),
     }), 200
 
 
@@ -1575,11 +1637,37 @@ def set_llm_config():
     data = request.get_json() or {}
     if 'enabled' in data:
         _llm_enabled = bool(data['enabled'])
+        app.config['LLM_RUNTIME_ENABLED'] = _llm_enabled
         logger.info(f"LLM verification toggled: {'ON' if _llm_enabled else 'OFF'}")
     return jsonify({
         'enabled': _llm_enabled,
         'model': Config.LLM_MODEL,
     })
+
+
+@app.route('/api/v1/llm/analyze', methods=['POST'])
+def analyze_llm():
+    """OTA_LLM 호환 LLM 분석 API."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({'error': 'Invalid JSON payload'}), 400
+
+    try:
+        req = normalize_llm_request(payload)
+        decision = analyze_llm_request(
+            req,
+            transport='http',
+            llm_enabled_override=bool(_llm_enabled),
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    published = False
+    if req.get('publish_mqtt', True) and llm_mqtt_bridge:
+        published = llm_mqtt_bridge.publish_decision(decision, req)
+
+    decision['published_mqtt'] = bool(published)
+    return jsonify(decision), 200
 
 
 @app.route('/api/ota/verify', methods=['POST'])
@@ -1787,6 +1875,29 @@ def list_firmware():
         return jsonify({'error': 'Internal server error'}), 500
 
 
+def initialize_server_runtime():
+    """wsgi/gunicorn 진입 시 공통 런타임 초기화."""
+    global _runtime_initialized
+    with _runtime_init_lock:
+        if _runtime_initialized:
+            return
+
+        Config.validate()
+        init_db()
+        with app.app_context():
+            _normalize_active_firmware()
+        init_mqtt()
+        init_llm_mqtt_bridge()
+        _runtime_initialized = True
+
+        logger.info(
+            "Server runtime initialized host=%s port=%s llm_mqtt_bridge=%s",
+            Config.HOST,
+            Config.PORT,
+            bool(Config.LLM_MQTT_BRIDGE_ENABLED),
+        )
+
+
 @app.teardown_appcontext
 def shutdown_session(exception=None):
     """요청 종료 시 세션 정리"""
@@ -1794,17 +1905,7 @@ def shutdown_session(exception=None):
 
 
 if __name__ == '__main__':
-    # 설정 검증
-    Config.validate()
-    
-    # 데이터베이스 초기화
-    init_db()
-    with app.app_context():
-        _normalize_active_firmware()
-    
-    # MQTT 핸들러 초기화
-    init_mqtt()
-    
+    initialize_server_runtime()
     # 서버 시작
     logger.info(f"Starting OTA Server on {Config.HOST}:{Config.PORT}")
     app.run(

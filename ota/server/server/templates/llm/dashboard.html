@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OTA LLM Dashboard</title>
+  <style>
+    :root {
+      --bg: #f6f8fb;
+      --panel: #ffffff;
+      --line: #dfe5ef;
+      --text: #1f2937;
+      --muted: #667085;
+      --approve: #0a8f44;
+      --reject: #c62828;
+      --other: #a16207;
+      --primary: #0b57d0;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Noto Sans KR", "Segoe UI", sans-serif;
+      background: linear-gradient(135deg, #eef3fb 0%, #f9fbff 100%);
+      color: var(--text);
+    }
+
+    .container {
+      max-width: 1100px;
+      margin: 24px auto;
+      padding: 0 16px;
+      display: grid;
+      gap: 14px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: 22px;
+    }
+
+    .meta {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: #f8fafc;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    button {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 9px 12px;
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 14px;
+    }
+
+    button.primary {
+      border-color: var(--primary);
+      background: var(--primary);
+      color: #fff;
+      font-weight: 600;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 260px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      font-family: "JetBrains Mono", "Consolas", monospace;
+      font-size: 13px;
+      line-height: 1.45;
+      resize: vertical;
+      background: #fbfdff;
+      color: #111827;
+    }
+
+    .decision {
+      font-size: 24px;
+      font-weight: 700;
+      margin: 0 0 8px;
+    }
+
+    .decision.approve { color: var(--approve); }
+    .decision.reject { color: var(--reject); }
+    .decision.other { color: var(--other); }
+
+    .kv {
+      margin: 6px 0;
+      font-size: 14px;
+      color: #334155;
+      word-break: break-word;
+    }
+
+    pre {
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #0f172a;
+      color: #e2e8f0;
+      font-family: "JetBrains Mono", "Consolas", monospace;
+      font-size: 12px;
+      overflow: auto;
+      max-height: 300px;
+    }
+
+    .status {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 8px;
+      min-height: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="card">
+      <h1>OTA LLM Decision Dashboard</h1>
+      <div class="meta">
+        <span class="badge">LLM_VERIFY: {{ "ON" if llm_verify else "OFF" }}</span>
+        <span class="badge">MQTT_ENABLED: {{ "ON" if mqtt_enabled else "OFF" }}</span>
+        <span class="badge">API: POST /api/v1/llm/analyze</span>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="toolbar">
+        <button id="loadExample">예시 JSON 불러오기</button>
+        <button id="formatJson">JSON 포맷</button>
+        <button id="analyzeBtn" class="primary">분석 실행</button>
+      </div>
+      <textarea id="payload" placeholder="여기에 JSON 요청 본문을 붙여넣으세요."></textarea>
+      <div id="requestStatus" class="status"></div>
+    </section>
+
+    <section class="card">
+      <p id="decisionText" class="decision other">결과 대기</p>
+      <div class="kv"><strong>source:</strong> <span id="source">-</span></div>
+      <div class="kv"><strong>published_mqtt:</strong> <span id="published">-</span></div>
+      <div class="kv"><strong>reason:</strong> <span id="reason">-</span></div>
+      <div class="kv"><strong>analyzed_at:</strong> <span id="analyzedAt">-</span></div>
+    </section>
+
+    <section class="card">
+      <h3 style="margin-top:0">Raw Response</h3>
+      <pre id="rawResponse">{}</pre>
+    </section>
+  </div>
+
+  <script>
+    const payloadEl = document.getElementById("payload");
+    const statusEl = document.getElementById("requestStatus");
+    const decisionEl = document.getElementById("decisionText");
+    const sourceEl = document.getElementById("source");
+    const publishedEl = document.getElementById("published");
+    const reasonEl = document.getElementById("reason");
+    const analyzedAtEl = document.getElementById("analyzedAt");
+    const rawEl = document.getElementById("rawResponse");
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function renderDecision(resp) {
+      const decision = String(resp?.decision || "UNKNOWN").toUpperCase();
+      decisionEl.textContent = decision;
+      decisionEl.classList.remove("approve", "reject", "other");
+      if (decision === "APPROVE") decisionEl.classList.add("approve");
+      else if (decision === "REJECT") decisionEl.classList.add("reject");
+      else decisionEl.classList.add("other");
+
+      sourceEl.textContent = resp?.source ?? "-";
+      publishedEl.textContent = String(resp?.published_mqtt ?? "-");
+      reasonEl.textContent = resp?.reason ?? "-";
+      analyzedAtEl.textContent = resp?.analyzed_at ?? "-";
+      rawEl.textContent = JSON.stringify(resp, null, 2);
+    }
+
+    async function loadExample() {
+      setStatus("예시 JSON 로딩 중...");
+      try {
+        const res = await fetch("/api/v1/llm/example-request");
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error || "load failed");
+        payloadEl.value = JSON.stringify(data, null, 2);
+        setStatus("예시 JSON 로드 완료");
+      } catch (err) {
+        setStatus(`예시 로드 실패: ${err.message}`);
+      }
+    }
+
+    function formatJson() {
+      try {
+        const obj = JSON.parse(payloadEl.value);
+        payloadEl.value = JSON.stringify(obj, null, 2);
+        setStatus("JSON 포맷 완료");
+      } catch (err) {
+        setStatus(`JSON 파싱 오류: ${err.message}`);
+      }
+    }
+
+    async function analyze() {
+      setStatus("분석 요청 전송 중...");
+      let payload;
+      try {
+        payload = JSON.parse(payloadEl.value);
+      } catch (err) {
+        setStatus(`JSON 파싱 오류: ${err.message}`);
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/v1/llm/analyze", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        renderDecision(data);
+        if (res.ok) setStatus("분석 완료");
+        else setStatus(`분석 실패: ${data?.error || res.status}`);
+      } catch (err) {
+        setStatus(`요청 실패: ${err.message}`);
+      }
+    }
+
+    document.getElementById("loadExample").addEventListener("click", loadExample);
+    document.getElementById("formatJson").addEventListener("click", formatJson);
+    document.getElementById("analyzeBtn").addEventListener("click", analyze);
+
+    loadExample();
+  </script>
+</body>
+</html>
