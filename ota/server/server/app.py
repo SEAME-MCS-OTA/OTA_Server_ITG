@@ -1289,20 +1289,47 @@ def upload_firmware():
 
         db.session.commit()
 
+        announce_sent = False
+        announce_error = ""
+        release_id = f"release:{firmware.version}"
+        release_payload = {
+            'ota_id': release_id,
+            'version': firmware.version,
+            'filename': firmware.filename,
+            'url': build_firmware_url(firmware.filename),
+            'sha256': firmware.sha256,
+            'size': int(firmware.file_size or 0),
+        }
+        if (mqtt_handler is None) or (not mqtt_handler.is_connected()):
+            init_mqtt()
+        if mqtt_handler and mqtt_handler.is_connected():
+            announce_sent = mqtt_handler.publish_release_announcement(release_payload)
+            if not announce_sent:
+                announce_error = "publish failed"
+        else:
+            announce_error = "mqtt not connected"
+
         total_sec = time.monotonic() - started_at
         logger.info(
-            "Firmware upload timing: version=%s file=%s size_mib=%.1f save_hash_sec=%.2f total_sec=%.2f",
+            "Firmware upload timing: version=%s file=%s size_mib=%.1f save_hash_sec=%.2f total_sec=%.2f announce_sent=%s",
             version_str,
             filename,
             file_size / (1024.0 * 1024.0),
             save_and_hash_sec,
             total_sec,
+            announce_sent,
         )
 
         return jsonify({
             'success': True,
             'updated': bool(existing_firmware),
-            'firmware': firmware.to_dict()
+            'firmware': firmware.to_dict(),
+            'announce': {
+                'sent': announce_sent,
+                'topic': Config.MQTT_TOPIC_RELEASE_ANNOUNCE,
+                'release_id': release_id,
+                'error': announce_error,
+            },
         }), status_code
 
     except IntegrityError:
