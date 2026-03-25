@@ -313,6 +313,36 @@ def _persist_llm_analyze_result(req: dict, decision: dict) -> None:
         logger.warning("Failed to persist LLM analyze result: %s", ex, exc_info=True)
 
 
+def _publish_client_log_to_llm_request(log_payload: dict) -> tuple[bool, str]:
+    """`/api/v1/client-logs` payload를 LLM request topic으로 발행."""
+    global llm_mqtt_bridge
+
+    if not Config.LLM_MQTT_BRIDGE_ENABLED:
+        return False, "LLM MQTT bridge disabled"
+
+    if llm_mqtt_bridge is None or not llm_mqtt_bridge.is_connected():
+        init_llm_mqtt_bridge()
+
+    if llm_mqtt_bridge is None or not llm_mqtt_bridge.is_connected():
+        return False, "LLM MQTT bridge not connected"
+
+    if not isinstance(log_payload, dict):
+        return False, "Invalid log payload"
+
+    request_payload = {
+        'request_id': f"client-log-{int(time.time() * 1000)}",
+        'vehicle_id': str(log_payload.get('device_id') or '').strip() or 'unknown',
+        'ota_id': str(log_payload.get('ota_id') or '').strip(),
+        'publish_mqtt': True,
+        'include_input': False,
+        'log': log_payload,
+    }
+    ok = llm_mqtt_bridge.publish_request(request_payload)
+    if not ok:
+        return False, "Failed to publish to LLM MQTT request topic"
+    return True, ""
+
+
 def init_llm_mqtt_bridge():
     """OTA_LLM MQTT bridge 초기화."""
     global llm_mqtt_bridge
@@ -990,7 +1020,7 @@ def report_status():
 @app.route('/api/v1/client-logs', methods=['POST'])
 def ingest_client_logs():
     """
-    OTA 클라이언트가 OTA 종료 시점에 업로드하는 raw log snapshot 저장 API.
+    OTA 클라이언트 raw log를 수신해 LLM request topic으로 즉시 발행.
 
     Request Body:
         {
@@ -1068,29 +1098,34 @@ def ingest_client_logs():
             )
             db.session.add(history)
 
-        captured_at = datetime.utcnow()
-        log_path = _persist_client_log_snapshot(
-            vehicle_id=vehicle_id,
-            target_version=target_version,
-            payload=data,
-            captured_at=captured_at,
-        )
+        # Client raw log snapshot은 서버에 저장하지 않고, LLM request 토픽으로 즉시 전달한다.
         history.client_log_json = None
-        history.client_log_path = log_path
-        history.client_log_updated_at = captured_at
+        history.client_log_path = None
+        history.client_log_updated_at = None
+
+        forwarded, forward_error = _publish_client_log_to_llm_request(data)
+        if not forwarded:
+            db.session.rollback()
+            return jsonify({
+                'error': 'Failed to forward client logs to LLM request topic',
+                'detail': forward_error,
+            }), 502
 
         db.session.commit()
         logger.info(
-            "Stored client OTA log snapshot vehicle=%s target=%s phase=%s event=%s lines=%s path=%s",
+            "Forwarded client OTA log to LLM request topic vehicle=%s target=%s phase=%s event=%s lines=%s topic=%s",
             vehicle_id,
             target_version,
             phase or '-',
             event or '-',
             len(data.get('ota_log') or []) if isinstance(data.get('ota_log'), list) else 0,
-            log_path,
+            Config.LLM_MQTT_TOPIC_REQUEST,
         )
 
-        return jsonify({'success': True}), 200
+        return jsonify({
+            'success': True,
+            'forwarded_to_topic': Config.LLM_MQTT_TOPIC_REQUEST,
+        }), 200
 
     except Exception as e:
         logger.error(f"Error in ingest_client_logs: {e}", exc_info=True)

@@ -115,3 +115,23 @@ class LLMMQTTBridge:
         if not ok:
             logger.error("Failed publish decision topic=%s rc=%s", topic, result.rc)
         return ok
+
+    def publish_request(self, payload: Dict[str, Any]) -> bool:
+        if self._client is None or not self._connected:
+            return False
+
+        message = json.dumps(payload, ensure_ascii=False)
+        result = self._client.publish(
+            Config.LLM_MQTT_TOPIC_REQUEST,
+            message,
+            qos=Config.LLM_MQTT_QOS,
+            retain=False,
+        )
+        ok = result.rc == mqtt.MQTT_ERR_SUCCESS
+        if not ok:
+            logger.error(
+                "Failed publish request topic=%s rc=%s",
+                Config.LLM_MQTT_TOPIC_REQUEST,
+                result.rc,
+            )
+        return ok
