@@ -24,7 +24,7 @@ def root_dashboard():
         llm_verify=bool(
             current_app.config.get("LLM_RUNTIME_ENABLED", Config.LLM_VERIFICATION_ENABLED)
         ),
-        mqtt_enabled=bool(Config.LLM_MQTT_BRIDGE_ENABLED),
+        mqtt_enabled=bool(current_app.config.get("LLM_REQUEST_MQTT_ENABLED", False)),
     )
 
 
@@ -36,7 +36,7 @@ def dashboard_page():
         llm_verify=bool(
             current_app.config.get("LLM_RUNTIME_ENABLED", Config.LLM_VERIFICATION_ENABLED)
         ),
-        mqtt_enabled=bool(Config.LLM_MQTT_BRIDGE_ENABLED),
+        mqtt_enabled=bool(current_app.config.get("LLM_REQUEST_MQTT_ENABLED", False)),
     )
 
 

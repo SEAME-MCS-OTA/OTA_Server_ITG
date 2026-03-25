@@ -51,6 +51,7 @@ app.config.from_object(Config)
 CORS(app)
 app.register_blueprint(llm_dashboard_bp)
 app.config['LLM_RUNTIME_ENABLED'] = bool(Config.LLM_VERIFICATION_ENABLED)
+app.config['LLM_REQUEST_MQTT_ENABLED'] = False
 
 # 데이터베이스 초기화
 db.init_app(app)
@@ -344,46 +345,29 @@ def _publish_client_log_to_llm_request(log_payload: dict) -> tuple[bool, str]:
 
 
 def init_llm_mqtt_bridge():
-    """OTA_LLM MQTT bridge 초기화."""
+    """verify-only 정책에서 LLM request MQTT bridge 비활성화."""
     global llm_mqtt_bridge
     global _llm_mqtt_last_retry_at
 
-    if not Config.LLM_MQTT_BRIDGE_ENABLED:
-        return
-
-    try:
-        _llm_mqtt_last_retry_at = time.monotonic()
-        if llm_mqtt_bridge:
-            try:
-                llm_mqtt_bridge.stop()
-            except Exception:
-                pass
-        llm_mqtt_bridge = LLMMQTTBridge(on_request=_build_llm_decision)
-        llm_mqtt_bridge.start()
-        logger.info("LLM MQTT bridge initialized")
-    except Exception as e:
-        logger.error("Failed to initialize LLM MQTT bridge: %s", e, exc_info=True)
-        logger.warning("Server will run without LLM MQTT bridge support")
+    _llm_mqtt_last_retry_at = time.monotonic()
+    if llm_mqtt_bridge:
+        try:
+            llm_mqtt_bridge.stop()
+        except Exception:
+            pass
+    llm_mqtt_bridge = None
+    logger.info("LLM request MQTT bridge disabled (verify-only mode)")
 
 @app.before_request
 def before_request():
     """첫 요청 시 MQTT 초기화"""
     global mqtt_handler
     global _mqtt_last_retry_at
-    global llm_mqtt_bridge
-    global _llm_mqtt_last_retry_at
     _probe_local_devices_once(force=False)
     need_init = mqtt_handler is None or not mqtt_handler.is_connected()
     retry_due = (time.monotonic() - _mqtt_last_retry_at) >= _MQTT_RETRY_INTERVAL_SEC
     if need_init and retry_due:
         init_mqtt()
-    if Config.LLM_MQTT_BRIDGE_ENABLED:
-        llm_need_init = llm_mqtt_bridge is None or not llm_mqtt_bridge.is_connected()
-        llm_retry_due = (
-            time.monotonic() - _llm_mqtt_last_retry_at
-        ) >= _LLM_MQTT_RETRY_INTERVAL_SEC
-        if llm_need_init and llm_retry_due:
-            init_llm_mqtt_bridge()
 
 def compare_versions(v1: str, v2: str) -> int:
     """
@@ -757,8 +741,8 @@ def healthz():
     return jsonify({
         'status': 'ok',
         'service': 'ota-server-itg',
-        'mqtt_enabled': bool(Config.LLM_MQTT_BRIDGE_ENABLED),
-        'mqtt_connected': llm_mqtt_bridge.is_connected() if llm_mqtt_bridge else False,
+        'mqtt_enabled': False,
+        'mqtt_connected': False,
         'llm_verify': bool(_llm_enabled),
     }), 200
 
@@ -1020,7 +1004,7 @@ def report_status():
 @app.route('/api/v1/client-logs', methods=['POST'])
 def ingest_client_logs():
     """
-    OTA 클라이언트 raw log를 수신해 LLM request topic으로 즉시 발행.
+    OTA 클라이언트 raw log snapshot 저장 API.
 
     Request Body:
         {
@@ -1098,34 +1082,29 @@ def ingest_client_logs():
             )
             db.session.add(history)
 
-        # Client raw log snapshot은 서버에 저장하지 않고, LLM request 토픽으로 즉시 전달한다.
+        captured_at = datetime.utcnow()
+        log_path = _persist_client_log_snapshot(
+            vehicle_id=vehicle_id,
+            target_version=target_version,
+            payload=data,
+            captured_at=captured_at,
+        )
         history.client_log_json = None
-        history.client_log_path = None
-        history.client_log_updated_at = None
-
-        forwarded, forward_error = _publish_client_log_to_llm_request(data)
-        if not forwarded:
-            db.session.rollback()
-            return jsonify({
-                'error': 'Failed to forward client logs to LLM request topic',
-                'detail': forward_error,
-            }), 502
+        history.client_log_path = log_path
+        history.client_log_updated_at = captured_at
 
         db.session.commit()
         logger.info(
-            "Forwarded client OTA log to LLM request topic vehicle=%s target=%s phase=%s event=%s lines=%s topic=%s",
+            "Stored client OTA log snapshot vehicle=%s target=%s phase=%s event=%s lines=%s path=%s",
             vehicle_id,
             target_version,
             phase or '-',
             event or '-',
             len(data.get('ota_log') or []) if isinstance(data.get('ota_log'), list) else 0,
-            Config.LLM_MQTT_TOPIC_REQUEST,
+            log_path,
         )
 
-        return jsonify({
-            'success': True,
-            'forwarded_to_topic': Config.LLM_MQTT_TOPIC_REQUEST,
-        }), 200
+        return jsonify({'success': True}), 200
 
     except Exception as e:
         logger.error(f"Error in ingest_client_logs: {e}", exc_info=True)
@@ -1703,28 +1682,11 @@ def set_llm_config():
 
 @app.route('/api/v1/llm/analyze', methods=['POST'])
 def analyze_llm():
-    """OTA_LLM 호환 LLM 분석 API."""
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({'error': 'Invalid JSON payload'}), 400
-
-    try:
-        req = normalize_llm_request(payload)
-        decision = analyze_llm_request(
-            req,
-            transport='http',
-            llm_enabled_override=bool(_llm_enabled),
-        )
-        _persist_llm_analyze_result(req, decision)
-    except Exception as exc:
-        return jsonify({'error': str(exc)}), 400
-
-    published = False
-    if req.get('publish_mqtt', True) and llm_mqtt_bridge:
-        published = llm_mqtt_bridge.publish_decision(decision, req)
-
-    decision['published_mqtt'] = bool(published)
-    return jsonify(decision), 200
+    """verify-only 정책에서 비활성화된 LLM analyze API."""
+    return jsonify({
+        'error': 'Disabled endpoint',
+        'message': 'LLM analysis is available only via POST /api/ota/verify',
+    }), 410
 
 
 @app.route('/api/ota/verify', methods=['POST'])
@@ -1754,9 +1716,8 @@ def verify_ota_update():
                 "raw_response": None,
             }
 
-        # `/api/ota/verify`는 OTA 실행 제어용 응답만 반환하고,
-        # 대시보드용 LLM 결과 저장은 `/api/v1/client-logs -> ota/llm/request`
-        # 파이프라인에서만 수행한다.
+        # verify-only 정책: 대시보드용 LLM 결과도 본 경로에서만 저장한다.
+        save_verification_result(ota_log, result)
 
         logger.info(
             "OTA verify: vehicle=%s decision=%s llm_enabled=%s",
