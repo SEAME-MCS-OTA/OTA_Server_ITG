@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, send_file    # request: 클라이언트의 HTTP 요청 전체 
+from flask import Flask, request, jsonify, send_file, has_request_context    # request: 클라이언트의 HTTP 요청 전체 
 from flask_cors import CORS
 from packaging import version
 from sqlalchemy.exc import IntegrityError
@@ -277,7 +277,10 @@ def init_mqtt():
             except Exception:
                 pass
         with app.app_context():
-            mqtt_handler = MQTTHandler(app.app_context)
+            mqtt_handler = MQTTHandler(
+                app.app_context,
+                on_update_request=_handle_mqtt_update_request,
+            )
             mqtt_handler.connect()
             logger.info("MQTT handler initialized and connected")
     except Exception as e:
@@ -440,6 +443,10 @@ def build_firmware_url(filename: str) -> str:
     """외부 장치가 접근 가능한 펌웨어 URL 생성"""
     if Config.FIRMWARE_BASE_URL:
         return f"{Config.FIRMWARE_BASE_URL}/firmware/{filename}"
+    if not has_request_context():
+        # MQTT-triggered update requests can run without an active HTTP request.
+        fallback_host = "localhost" if str(Config.HOST or "").strip() in {"", "0.0.0.0"} else str(Config.HOST).strip()
+        return f"http://{fallback_host}:{Config.PORT}/firmware/{filename}"
     return f"{request.url_root.rstrip('/')}/firmware/{filename}"
 
 
@@ -1462,48 +1469,41 @@ def delete_firmware(firmware_id):
         return jsonify({'error': 'Internal server error'}), 500
 
 
-@app.route('/api/v1/admin/trigger-update', methods=['POST'])
-def trigger_update():
-    """
-    특정 차량에 업데이트 명령 전송 (MQTT) -> 관리자가
-    
-    Request Body:
-        {
-            "vehicle_id": "vehicle_001",
-            "version": "1.0.1"  # 선택적, 없으면 최신 버전
-        }
-    """
+def _trigger_update_internal(
+    vehicle_id: str,
+    target_version: str = "",
+    force_trigger: bool = False,
+    source: str = "api",
+):
+    """HTTP API와 MQTT register-trigger가 공유하는 OTA trigger 핵심 로직."""
     try:
-        data = request.get_json()
-        
-        if not data or 'vehicle_id' not in data:
-            return jsonify({'error': 'vehicle_id is required'}), 400
-        
-        vehicle_id = data['vehicle_id']
+        vehicle_id = str(vehicle_id or "").strip()
+        if not vehicle_id:
+            return {'error': 'vehicle_id is required'}, 400
+
         _probe_local_devices_once(force=True)
-        target_version = str(data.get('version') or '').strip() or None
-        force_trigger = parse_bool(data.get('force'), default=False)
-        
+        target_version = str(target_version or '').strip() or None
+
         # 특정 버전이 지정되면 active 여부와 무관하게 해당 버전을 사용한다.
         # (대시보드에서 이전 버전/동일 버전 재설치를 허용하기 위함)
         if target_version:
             firmware = Firmware.query.filter_by(version=target_version).first()
             if not firmware:
-                return jsonify({
+                return {
                     'error': f'Firmware version {target_version} not found',
                     'target_version': target_version,
-                }), 404
+                }, 404
         else:
             firmware = _pick_latest_active_firmware()
-        
+
         if not firmware:
-            return jsonify({'error': 'No active firmware found'}), 404
+            return {'error': 'No active firmware found'}, 404
 
         # 기본 정책: 최근 접속 차량만 트리거 허용 (오프라인/ID 불일치 조기 탐지)
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if Config.REQUIRE_RECENT_VEHICLE and not force_trigger:
             if not vehicle:
-                return jsonify({
+                return {
                     'error': 'Vehicle not registered',
                     'vehicle_id': vehicle_id,
                     'hint': (
@@ -1511,43 +1511,43 @@ def trigger_update():
                         "it matches dashboard vehicle_id."
                     ),
                     'cmd_topic': _format_cmd_topic(vehicle_id),
-                }), 409
+                }, 409
 
         # 진행 중 상태에서 중복 트리거를 막아 false fail(OTA already running) 발생을 방지.
         if vehicle and not force_trigger:
             in_progress_states = {'pending', 'downloading', 'verifying', 'installing'}
             if str(vehicle.status or '').strip().lower() in in_progress_states:
-                return jsonify({
+                return {
                     'error': 'Update already in progress',
                     'vehicle_id': vehicle_id,
                     'status': vehicle.status,
                     'hint': 'Wait for completion/reboot before sending another trigger.',
-                }), 409
+                }, 409
 
             # 이미 동일(또는 더 높은) 버전이면 기본적으로 트리거를 막는다.
             if vehicle.current_version:
                 cmp_result = compare_versions(vehicle.current_version, firmware.version)
                 if cmp_result >= 0:
-                    return jsonify({
+                    return {
                         'error': 'Vehicle already up to date',
                         'vehicle_id': vehicle_id,
                         'current_version': vehicle.current_version,
                         'target_version': firmware.version,
                         'hint': 'Set force=true to trigger anyway.',
-                    }), 409
+                    }, 409
 
             last_seen = vehicle.last_seen
             now = datetime.utcnow()
             if (not last_seen) or ((now - last_seen) > timedelta(seconds=Config.VEHICLE_ONLINE_WINDOW_SEC)):
-                return jsonify({
+                return {
                     'error': 'Vehicle is offline or stale',
                     'vehicle_id': vehicle_id,
                     'last_seen': last_seen.isoformat() if last_seen else None,
                     'online_window_sec': Config.VEHICLE_ONLINE_WINDOW_SEC,
                     'hint': 'Set force=true to bypass this check.',
                     'cmd_topic': _format_cmd_topic(vehicle_id),
-                }), 409
-        
+                }, 409
+
         # 펌웨어 정보 구성
         firmware_url = build_firmware_url(firmware.filename)
         if _url_points_to_localhost(firmware_url):
@@ -1556,11 +1556,11 @@ def trigger_update():
                 vehicle_id,
                 firmware_url,
             )
-            return jsonify({
+            return {
                 'error': 'Firmware URL resolves to localhost',
                 'computed_url': firmware_url,
                 'hint': 'Set OTA_GH_FIRMWARE_BASE_URL=http://<HOST_IP>:8080 and restart ota_gh_server.',
-            }), 409
+            }, 409
 
         ota_id = _build_ota_id(vehicle_id)
         firmware_info = {
@@ -1612,11 +1612,11 @@ def trigger_update():
                     "Failed to trigger update for %s via HTTP-first and MQTT fallback: %s",
                     vehicle_id, reason_http
                 )
-                return jsonify({
+                return {
                     'error': 'Failed to send update command',
                     'detail': reason_http,
                     'cmd_topic': _format_cmd_topic(vehicle_id),
-                }), 500
+                }, 500
         else:
             # MQTT 우선, 실패 시 HTTP 폴백
             if mqtt_handler and mqtt_handler.is_connected() and mqtt_handler.publish_update_command(vehicle_id, firmware_info, ota_id=ota_id):
@@ -1632,51 +1632,102 @@ def trigger_update():
                         "Failed to trigger update for %s via both MQTT and HTTP fallback: %s",
                         vehicle_id, reason_http
                     )
-                    return jsonify({
+                    return {
                         'error': 'Failed to send update command',
                         'detail': reason_http,
                         'cmd_topic': _format_cmd_topic(vehicle_id),
-                    }), 500
+                    }, 500
 
-        if sent_via:
-            # IMPORTANT: keep last_seen as device heartbeat only.
-            # Do not refresh it on trigger request, otherwise stale/offline checks become meaningless.
-            if vehicle:
-                vehicle.status = 'pending'
-                pending = UpdateHistory(
-                    vehicle_id=vehicle_id,
-                    firmware_id=firmware.id,
-                    from_version=vehicle.current_version,
-                    target_version=firmware.version,
-                    status='pending',
-                    progress=0,
-                    message=trigger_note
-                )
-                db.session.add(pending)
-                db.session.commit()
-            else:
-                logger.warning(
-                    "Update command sent to unknown vehicle_id=%s (no DB row, no pending history).",
-                    vehicle_id
-                )
+        if not sent_via:
+            return {'error': 'Failed to send update command'}, 500
 
-            logger.info(
-                "Update command sent to %s: %s via %s",
-                vehicle_id, firmware.version, sent_via
+        # IMPORTANT: keep last_seen as device heartbeat only.
+        # Do not refresh it on trigger request, otherwise stale/offline checks become meaningless.
+        if vehicle:
+            vehicle.status = 'pending'
+            pending = UpdateHistory(
+                vehicle_id=vehicle_id,
+                firmware_id=firmware.id,
+                from_version=vehicle.current_version,
+                target_version=firmware.version,
+                status='pending',
+                progress=0,
+                message=trigger_note
             )
-            return jsonify({
-                'success': True,
-                'vehicle_id': vehicle_id,
-                'version': firmware.version,
-                'ota_id': ota_id,
-                'url': firmware_url,
-                'cmd_topic': _format_cmd_topic(vehicle_id),
-                'transport': sent_via,
-            })
-    
+            db.session.add(pending)
+            db.session.commit()
+        else:
+            logger.warning(
+                "Update command sent to unknown vehicle_id=%s (no DB row, no pending history).",
+                vehicle_id
+            )
+
+        logger.info(
+            "Update command sent to %s: %s via %s source=%s",
+            vehicle_id, firmware.version, sent_via, source
+        )
+        return {
+            'success': True,
+            'vehicle_id': vehicle_id,
+            'version': firmware.version,
+            'ota_id': ota_id,
+            'url': firmware_url,
+            'cmd_topic': _format_cmd_topic(vehicle_id),
+            'transport': sent_via,
+        }, 200
     except Exception as e:
-        logger.error(f"Error triggering update: {e}", exc_info=True)
-        return jsonify({'error': 'Internal server error'}), 500
+        logger.error("Error triggering update source=%s: %s", source, e, exc_info=True)
+        db.session.rollback()
+        return {'error': 'Internal server error'}, 500
+
+
+def _handle_mqtt_update_request(vehicle_id: str, data: dict):
+    """`ota/vehicles/register`의 update_request trigger를 실제 OTA trigger로 연결."""
+    payload = data if isinstance(data, dict) else {}
+    target_version = str(payload.get('version') or payload.get('target_version') or '').strip()
+    force_trigger = parse_bool(payload.get('force'), default=False)
+    release_id = str(payload.get('release_id') or payload.get('ota_id') or '').strip()
+
+    response, status_code = _trigger_update_internal(
+        vehicle_id=vehicle_id,
+        target_version=target_version,
+        force_trigger=force_trigger,
+        source='mqtt_register',
+    )
+    if status_code >= 400:
+        logger.warning(
+            "MQTT register update-request failed vehicle_id=%s release_id=%s version=%s status=%s detail=%s",
+            vehicle_id,
+            release_id or "-",
+            target_version or "-",
+            status_code,
+            response.get('error') if isinstance(response, dict) else response,
+        )
+    else:
+        logger.info(
+            "MQTT register update-request accepted vehicle_id=%s release_id=%s version=%s",
+            vehicle_id,
+            release_id or "-",
+            target_version or "-",
+        )
+
+
+@app.route('/api/v1/admin/trigger-update', methods=['POST'])
+def trigger_update():
+    """
+    특정 차량에 업데이트 명령 전송 (MQTT/HTTP fallback) -> 관리자 API
+    """
+    data = request.get_json(silent=True) or {}
+    if 'vehicle_id' not in data:
+        return jsonify({'error': 'vehicle_id is required'}), 400
+
+    response, status_code = _trigger_update_internal(
+        vehicle_id=str(data.get('vehicle_id') or '').strip(),
+        target_version=str(data.get('version') or '').strip(),
+        force_trigger=parse_bool(data.get('force'), default=False),
+        source='api',
+    )
+    return jsonify(response), status_code
 
 
 # ── LLM 런타임 토글 상태 ──────────────────────
