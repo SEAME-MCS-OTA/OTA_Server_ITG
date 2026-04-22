@@ -31,18 +31,6 @@ def _env_bool_first(*names: str, default: bool = False) -> bool:
     return default
 
 
-def _env_int_first(*names: str, default: int) -> int:
-    for name in names:
-        raw = os.getenv(name)
-        if raw is None:
-            continue
-        try:
-            return int(str(raw).strip())
-        except Exception:
-            continue
-    return int(default)
-
-
 def _mqtt_transport() -> str:
     raw = str(os.getenv('MQTT_TRANSPORT', 'tcp') or '').strip().lower()
     if raw in {'ws', 'wss', 'websocket', 'websockets'}:
@@ -155,48 +143,13 @@ class Config:
     LOCAL_TRIGGER_FIRST = os.getenv('LOCAL_TRIGGER_FIRST', 'true').lower() in {
         '1', 'true', 'yes', 'y', 'on'
     }
+    MQTT_COMMAND_ONLY = _env_bool('MQTT_COMMAND_ONLY', default=True)
     
     # LLM 2차 검증 설정
     LLM_VERIFICATION_ENABLED = os.getenv('LLM_VERIFY', 'true').lower() in {
         '1', 'true', 'yes', 'y', 'on'
     }
     LLM_MODEL = os.getenv('LLM_MODEL', 'claude-sonnet-4-20250514')
-    ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '').strip()
-    LLM_TIMEOUT_SEC = float(os.getenv('LLM_TIMEOUT_SEC', '10.0'))
-    LLM_MAX_EVIDENCE_CHARS = _env_int_first('LLM_MAX_EVIDENCE_CHARS', default=8000)
-    LLM_MAX_LOG_JSON_CHARS = _env_int_first('LLM_MAX_LOG_JSON_CHARS', default=12000)
-    FAILSAFE_DECISION = os.getenv('FAILSAFE_DECISION', 'REJECT').strip().upper()
-
-    # OTA_LLM MQTT bridge 설정
-    LLM_MQTT_BRIDGE_ENABLED = _env_bool_first(
-        'LLM_MQTT_BRIDGE_ENABLED',
-        'MQTT_ENABLED',
-        default=True,
-    )
-    LLM_MQTT_CLIENT_ID = _env_first(
-        'LLM_MQTT_CLIENT_ID',
-        'MQTT_CLIENT_ID',
-        default='ota-llm-service',
-    )
-    if LLM_MQTT_CLIENT_ID == MQTT_CLIENT_ID:
-        LLM_MQTT_CLIENT_ID = f"{MQTT_CLIENT_ID}-llm"
-    LLM_MQTT_KEEPALIVE = _env_int_first('LLM_MQTT_KEEPALIVE', 'MQTT_KEEPALIVE', default=60)
-    LLM_MQTT_QOS = _env_int_first('LLM_MQTT_QOS', 'MQTT_QOS', default=1)
-    LLM_MQTT_TOPIC_REQUEST = _env_first(
-        'LLM_MQTT_TOPIC_REQUEST',
-        'MQTT_TOPIC_REQUEST',
-        default='ota/llm/request',
-    )
-    LLM_MQTT_TOPIC_DECISION_TEMPLATE = _env_first(
-        'LLM_MQTT_TOPIC_DECISION_TEMPLATE',
-        'MQTT_TOPIC_DECISION_TEMPLATE',
-        default='ota/{vehicle_id}/llm/decision',
-    )
-    LLM_MQTT_DECISION_RETAIN = _env_bool_first(
-        'LLM_MQTT_DECISION_RETAIN',
-        'MQTT_DECISION_RETAIN',
-        default=False,
-    )
     LLM_LOG_PATH = os.getenv(
         'LLM_LOG_PATH',
         os.path.join('.', 'logs', 'llm-verifier.log'),
