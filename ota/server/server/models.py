@@ -64,7 +64,6 @@ class Firmware(db.Model):
     file_path = db.Column(db.String(512), nullable=False)  # 전체 경로
     release_notes = db.Column(db.Text)
     is_active = db.Column(db.Boolean, default=True, index=True)
-    oci_uploaded = db.Column(db.Boolean, default=False)  # OCI Object Storage 업로드 여부
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -88,7 +87,6 @@ class Firmware(db.Model):
             'release_notes': self.release_notes,
             # 'description': self.description,
             'is_active': self.is_active,
-            'oci_uploaded': self.oci_uploaded,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None
         }
@@ -117,6 +115,9 @@ class UpdateHistory(db.Model):
     
     # 메시지 및 오류
     message = db.Column(db.Text)  # 범용 메시지
+    client_log_json = db.Column(db.Text)
+    client_log_path = db.Column(db.String(1024))
+    client_log_updated_at = db.Column(db.DateTime)
     
     # 타임스탬프
     started_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
@@ -144,6 +145,8 @@ class UpdateHistory(db.Model):
             'status': self.status,
             'progress': self.progress,
             'message': self.message,
+            'client_log_path': self.client_log_path,
+            'client_log_updated_at': self.client_log_updated_at.isoformat() if self.client_log_updated_at else None,
             # 'error_message': self.error_message,
             # 'rollback_reason': self.rollback_reason,
             'started_at': self.started_at.isoformat() if self.started_at else None,

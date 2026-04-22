@@ -64,6 +64,8 @@ services:
       OCI_PAR_TOKEN: ${OTA_GH_OCI_PAR_TOKEN:-}
       OCI_FIRMWARE_PREFIX: ${OTA_GH_OCI_FIRMWARE_PREFIX:-firmware}
       FIRMWARE_DIR: /app/firmware_files
+      CLIENT_LOG_DIR: /app/client_logs
+      LLM_LOG_PATH: /app/logs/llm-verifier.log
       LOG_LEVEL: ${OTA_GH_LOG_LEVEL:-INFO}
       REQUIRE_RECENT_VEHICLE: ${OTA_GH_REQUIRE_RECENT_VEHICLE:-true}
       VEHICLE_ONLINE_WINDOW_SEC: ${OTA_GH_VEHICLE_ONLINE_WINDOW_SEC:-300}
@@ -85,6 +87,8 @@ services:
       - "${OTA_GH_SERVER_PORT:-8080}:8080"
     volumes:
       - ./ota/server/firmware_files:/app/firmware_files
+      - ./ota/server/client_logs:/app/client_logs
+      - ./ota/server/logs:/app/logs
       - ./ota/keys/ed25519:/app/keys/ed25519:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

@@ -15,6 +15,22 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
 
 
+def _env_first(*names: str, default: str = '') -> str:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return str(raw).strip()
+    return str(default).strip()
+
+
+def _env_bool_first(*names: str, default: bool = False) -> bool:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is not None:
+            return str(raw).strip().lower() in {'1', 'true', 'yes', 'y', 'on'}
+    return default
+
+
 def _mqtt_transport() -> str:
     raw = str(os.getenv('MQTT_TRANSPORT', 'tcp') or '').strip().lower()
     if raw in {'ws', 'wss', 'websocket', 'websockets'}:
@@ -55,15 +71,21 @@ class Config:
     # 펌웨어 저장 경로
     FIRMWARE_DIR = os.getenv('FIRMWARE_DIR', './firmware_files')
     CLIENT_LOG_DIR = os.getenv('CLIENT_LOG_DIR', './client_logs')
-    COMMAND_SIGNING_ENABLED = _env_bool('COMMAND_SIGNING_ENABLED', default=True)
-    COMMAND_SIGNING_PRIVATE_KEY_PATH = os.getenv(
+    COMMAND_SIGNING_ENABLED = _env_bool_first(
+        'COMMAND_SIGNING_ENABLED',
+        'COMMAND_SIGN_ENABLED',
+        default=True,
+    )
+    COMMAND_SIGNING_PRIVATE_KEY_PATH = _env_first(
         'COMMAND_SIGNING_PRIVATE_KEY_PATH',
-        '',
-    ).strip()
-    COMMAND_SIGNING_KEY_ID = os.getenv(
+        'COMMAND_SIGN_KEY_PATH',
+        default='',
+    )
+    COMMAND_SIGNING_KEY_ID = _env_first(
         'COMMAND_SIGNING_KEY_ID',
-        'ota-ed25519-v1',
-    ).strip()
+        'COMMAND_SIGN_KEY_ID',
+        default='ota-ed25519-v1',
+    )
     
     # MQTT 설정
     MQTT_BROKER_HOST = os.getenv('MQTT_BROKER_HOST', 'localhost')
@@ -85,6 +107,9 @@ class Config:
     MQTT_TOPIC_CMD = 'ota/{vehicle_id}/cmd'
     MQTT_TOPIC_STATUS = 'ota/{vehicle_id}/status'
     MQTT_TOPIC_PROGRESS = 'ota/{vehicle_id}/progress'
+    MQTT_TOPIC_RELEASE_ANNOUNCE = os.getenv('MQTT_TOPIC_RELEASE_ANNOUNCE', 'ota/releases/announce')
+    MQTT_TOPIC_VEHICLE_REGISTER = os.getenv('MQTT_TOPIC_VEHICLE_REGISTER', 'ota/vehicles/register')
+    MQTT_ANNOUNCE_RETAIN = _env_bool('MQTT_ANNOUNCE_RETAIN', False)
 
     # OTA 결과 관제 서버(OTA_VLM) 연동
     MONITORING_INGEST_URL = os.getenv('MONITORING_INGEST_URL', '').strip()
@@ -118,6 +143,7 @@ class Config:
     LOCAL_TRIGGER_FIRST = os.getenv('LOCAL_TRIGGER_FIRST', 'true').lower() in {
         '1', 'true', 'yes', 'y', 'on'
     }
+    MQTT_COMMAND_ONLY = _env_bool('MQTT_COMMAND_ONLY', default=True)
     
     # LLM 2차 검증 설정
     LLM_VERIFICATION_ENABLED = os.getenv('LLM_VERIFY', 'true').lower() in {

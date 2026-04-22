@@ -86,6 +86,8 @@ docker compose -f docker-compose.ota-stack.yml ps
 - `POST /api/v1/admin/firmware`
 - `POST /api/v1/admin/trigger-update`
 - `POST /api/ota/verify`
+- `POST /api/v1/llm/analyze` (OTA_LLM 통합 분석 API)
+- `GET /llm/dashboard` (OTA_LLM 통합 대시보드)
 - `GET /firmware/<filename>`
 - `GET /stats/summary`
 

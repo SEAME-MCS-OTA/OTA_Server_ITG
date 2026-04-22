@@ -1,0 +1,121 @@
+{
+  "device_state": {
+    "current_slot_status": {
+      "artifact-repositories": [],
+      "boot_primary": "rootfs.1",
+      "booted": "A",
+      "compatible": "vw-ivi-telechips",
+      "slots": [
+        {
+          "rootfs.1": {
+            "boot_status": "bad",
+            "bootname": "B",
+            "class": "rootfs",
+            "device": "/dev/disk/by-partlabel/system_b",
+            "mountpoint": null,
+            "parent": null,
+            "slot_status": {
+              "activated": {
+                "count": 5,
+                "timestamp": "2026-03-23T12:44:10Z"
+              },
+              "bundle": {
+                "build": "20260323121358",
+                "compatible": "vw-ivi-telechips",
+                "description": "telechips-hu-bundle version 1.0-r0",
+                "hash": "56c36701740fb1196c268789746949e51bbfafafa13f8852bfd9578fc9b175ab",
+                "version": "1.0"
+              },
+              "checksum": {
+                "sha256": "a3e82f1ab4c4f16f037fc273ad2d3004e26e0259b1db55cf6c4b3a6d8a2074ce",
+                "size": 1052770304
+              },
+              "installed": {
+                "count": 5,
+                "timestamp": "2026-03-23T12:44:10Z"
+              },
+              "status": "ok"
+            },
+            "state": "inactive",
+            "type": "ext4"
+          }
+        },
+        {
+          "rootfs.0": {
+            "boot_status": "bad",
+            "bootname": "A",
+            "class": "rootfs",
+            "device": "/dev/disk/by-partlabel/system",
+            "mountpoint": null,
+            "parent": null,
+            "slot_status": {
+              "activated": {
+                "count": 4,
+                "timestamp": "2026-03-20T16:56:14Z"
+              },
+              "bundle": {
+                "build": "20260320164229",
+                "compatible": "vw-ivi-telechips",
+                "description": "telechips-hu-bundle version 1.0-r0",
+                "hash": "fbc3a73634977d597ac30f71fc563ccbd2ce6a5b419a5e9fd4d69ea297cd7d1d",
+                "version": "1.0.0"
+              },
+              "checksum": {
+                "sha256": "0f9e627d038948583c913ef33f6deefa7330ce7b1f04dbddef5a4b8c3a73a2df",
+                "size": 1052770304
+              },
+              "installed": {
+                "count": 4,
+                "timestamp": "2026-03-20T16:56:14Z"
+              },
+              "status": "ok"
+            },
+            "state": "booted",
+            "type": "ext4"
+          }
+        }
+      ],
+      "variant": ""
+    },
+    "recent_update_history": [],
+    "system_resources": {
+      "cpu_usage_percent": 0,
+      "disk_free_mb": 0,
+      "memory_usage_percent": 0
+    },
+    "vehicle_id": "vw-ivi-0026",
+    "vehicle_model": "Unknown"
+  },
+  "firmware_metadata": {
+    "build_server_info": "",
+    "bundle_hash": "",
+    "current_active_version": "1.1.0",
+    "expected_file_size_bytes": 0,
+    "firmware_file_size_bytes": 292276556,
+    "new_installed_version": "1.1.1",
+    "signature_verification": "PASSED",
+    "update_trigger_server": "http://192.168.86.44:8080/firmware/app_1.1.1.raucb"
+  },
+  "process_log": {
+    "chunk_transfer_summary": {
+      "max_retries_single_chunk": 0,
+      "retried_chunks": 0,
+      "successful_first_attempt": 0,
+      "total_chunks": 0
+    },
+    "download_duration_seconds": 0,
+    "download_end_time": null,
+    "download_start_time": null,
+    "integrity_check_result": "PASSED",
+    "mqtt_command_history": [
+      {
+        "payload_summary": "SOURCE mqtt",
+        "timestamp": "2026-03-23T12:44:10.630577Z",
+        "topic": "ota/update/trigger"
+      }
+    ],
+    "rauc_install_exit_code": 0,
+    "rauc_install_log_summary": "Installation completed without errors. Bundle verified. Slot B marked as primary."
+  },
+  "timestamp": "2026-03-23T12:44:10.829051Z"
+}
