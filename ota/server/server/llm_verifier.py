@@ -54,6 +54,15 @@ def get_llm_log_path() -> str:
 _configure_llm_file_logger()
 
 
+def _llm_temperature() -> float:
+    raw = os.getenv("LLM_TEMPERATURE", "0")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid LLM_TEMPERATURE=%r; falling back to 0", raw)
+        return 0.0
+
+
 def _extract_vehicle_versions(ota_log: dict) -> tuple[str, str, str]:
     """Extract vehicle/current/target versions from either legacy or v2 payloads."""
     if not isinstance(ota_log, dict):
@@ -940,7 +949,7 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
         response = client.messages.create(
             model=model,
             max_tokens=1600,
-            temperature=0,
+            temperature=_llm_temperature(),
             system=SYSTEM_PROMPT,
             messages=[
                 {

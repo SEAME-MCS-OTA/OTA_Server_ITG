@@ -2,5 +2,11 @@
 .claude/
 ota/server/release.env
 .env
+.env.redacted
 out/
 *.bak
+*.bak.*
+docker-compose.ota-stack.yml.bak.*
+ota/server/client_logs/
+ota/server/logs/
+ota/server/server/config/

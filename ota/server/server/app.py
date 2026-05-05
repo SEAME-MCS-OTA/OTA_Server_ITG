@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import requests
-from flask import Flask, request, jsonify, send_file    # request: 클라이언트의 HTTP 요청 전체
+from flask import Flask, request, jsonify, send_file    # request: 클라이언트의 HTTP 요청 전체 
 from flask_cors import CORS
 from packaging import version
 from sqlalchemy.exc import IntegrityError
@@ -306,7 +306,7 @@ def before_request():
 def compare_versions(v1: str, v2: str) -> int:
     """
     버전 비교 (semver)
-
+    
     Returns:
         -1: v1 < v2
          0: v1 == v2
@@ -315,7 +315,7 @@ def compare_versions(v1: str, v2: str) -> int:
     try:
         ver1 = version.parse(v1)
         ver2 = version.parse(v2)
-
+        
         if ver1 < ver2:
             return -1
         elif ver1 > ver2:
@@ -868,11 +868,11 @@ def ingest_proxy():
 def update_check():
     """
     업데이트 확인 API
-
+    
     Query Parameters:
         vehicle_id: 차량 ID (필수)
         current_version: 현재 버전 (필수)
-
+    
     Response:
         {
             "update_available": true/false,
@@ -886,16 +886,16 @@ def update_check():
     try:
         vehicle_id = request.args.get('vehicle_id')
         current_version = request.args.get('current_version')
-
+        
         # 필수 파라미터 검증
         if not vehicle_id or not current_version:
             return jsonify({
                 'error': 'Missing required parameters: vehicle_id, current_version'
             }), 400
-
+        
         logger.info(f"Update check request from vehicle {vehicle_id}, version {current_version}")
         request_ip = _client_ip_from_request()
-
+        
         # Vehicle upsert (없으면 생성, 있으면 업데이트)
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if vehicle:
@@ -910,27 +910,27 @@ def update_check():
             db.session.add(vehicle)
             logger.info(f"New vehicle registered: {vehicle_id}")
         _mark_vehicle_ip(vehicle, request_ip)
-
+        
         db.session.commit()
-
+        
         # 최신 active 펌웨어 조회
         # 지금 당장은 단순히 가장 최신 버전만 제공
         latest_firmware = _pick_latest_active_firmware()
-
+        
         if not latest_firmware:
             logger.warning("No active firmware available")
             return jsonify({
                 'update_available': False,
                 'message': 'No firmware available'
             })
-
+        
         # 버전 비교
         comparison = compare_versions(current_version, latest_firmware.version)
-
+        
         if comparison < 0:  # current_version < latest_version
             # 업데이트 가능
             firmware_url = build_firmware_url(latest_firmware.filename)
-
+            
             response = {
                 'update_available': True,
                 'version': latest_firmware.version,
@@ -939,12 +939,12 @@ def update_check():
                 'size': latest_firmware.file_size,
                 'release_notes': latest_firmware.release_notes or ''
             }
-
+            
             logger.info(
                 f"Update available for {vehicle_id}: "
                 f"{current_version} -> {latest_firmware.version}"
             )
-
+            
             return jsonify(response)
         else:
             # 이미 최신 버전
@@ -954,7 +954,7 @@ def update_check():
                 'current_version': current_version,
                 'latest_version': latest_firmware.version
             })
-
+    
     except Exception as e:
         logger.error(f"Error in update_check: {e}", exc_info=True)
         db.session.rollback()
@@ -965,7 +965,7 @@ def update_check():
 def report_status():
     """
     업데이트 상태 리포트 API
-
+    
     Request Body:
         {
             "vehicle_id": "vehicle_001",
@@ -977,33 +977,33 @@ def report_status():
     """
     try:
         data = request.get_json()
-
+        
         if not data:
             return jsonify({'error': 'No JSON data provided'}), 400
-
+        
         # 필수 필드 검증
         required_fields = ['vehicle_id', 'target_version', 'status']
         for field in required_fields:
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
-
+        
         vehicle_id = data['vehicle_id']
         target_version = data['target_version']
         incoming_status = data['status']
         progress = data.get('progress', 0)
         message = data.get('message', '')
-
+        
         # 유효한 status 값 검증
         valid_statuses = ['downloading', 'verifying', 'installing', 'completed', 'failed']
         if incoming_status not in valid_statuses:
             return jsonify({'error': f'Invalid status: {incoming_status}'}), 400
-
+        
         logger.info(
             f"Status report from {vehicle_id}: {incoming_status} "
             f"({progress}%) for version {target_version}"
         )
         request_ip = _client_ip_from_request()
-
+        
         # Vehicle 조회 또는 생성
         vehicle = Vehicle.query.filter_by(vehicle_id=vehicle_id).first()
         if not vehicle:
@@ -1024,14 +1024,14 @@ def report_status():
         vehicle.status = status
         if status == 'completed':
             vehicle.current_version = target_version
-
+        
         # UpdateHistory 업데이트 또는 생성
         history = UpdateHistory.query.filter_by(
             vehicle_id=vehicle_id,
             target_version=target_version
         ).order_by(UpdateHistory.started_at.desc()).first()
         prev_history_status = history.status if history else None
-
+        
         if history:
             history.status = status
             history.progress = progress
@@ -1042,7 +1042,7 @@ def report_status():
             # 새 히스토리 생성
             # firmware_id 조회
             firmware = Firmware.query.filter_by(version=target_version).first()
-
+            
             history = UpdateHistory(
                 vehicle_id=vehicle_id,
                 firmware_id=firmware.id if firmware else None,
@@ -1053,7 +1053,7 @@ def report_status():
                 message=message
             )
             db.session.add(history)
-
+        
         db.session.commit()
 
         # completed/failed 최종 상태를 관제 서버로 자동 전달
@@ -1068,14 +1068,14 @@ def report_status():
                 progress=progress,
                 source="api_report",
             )
-
+        
         return jsonify({
             'success': True,
             'vehicle_id': vehicle_id,
             'status': status,
             'progress': progress
         })
-
+    
     except Exception as e:
         logger.error(f"Error in report_status: {e}", exc_info=True)
         db.session.rollback()
@@ -1197,7 +1197,7 @@ def ingest_client_logs():
 def download_firmware(filename):
     """
     펌웨어 파일 다운로드
-
+    
     Args:
         filename: 펌웨어 파일명
     """
@@ -1211,7 +1211,7 @@ def download_firmware(filename):
             download_name=filename,
             mimetype=guessed or 'application/octet-stream'
         )
-
+    
     except Exception as e:
         logger.error(f"Error serving firmware: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
@@ -1221,7 +1221,7 @@ def download_firmware(filename):
 def upload_firmware():
     """
     펌웨어 업로드 및 등록 (관리자용)
-
+    
     Form Data:
         file: 펌웨어 파일
         version: 버전 (예: 1.0.1)
@@ -1232,18 +1232,18 @@ def upload_firmware():
         started_at = time.monotonic()
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
-
+        
         file = request.files['file']
         version_str = (request.form.get('version') or '').strip()
         release_notes = request.form.get('release_notes', '')
         overwrite = parse_bool(request.form.get('overwrite'), default=False)
-
+        
         if not version_str:
             return jsonify({'error': 'Version is required'}), 400
-
+        
         if file.filename == '':
             return jsonify({'error': 'No file selected'}), 400
-
+        
         # 파일명 생성
         original_name = secure_filename(file.filename or '')
         if not original_name:
@@ -1332,7 +1332,7 @@ def upload_firmware():
             os.path.exists(old_filepath)
         ):
             os.remove(old_filepath)
-
+        
         # DB 반영 (신규 등록 또는 기존 버전 갱신)
         if existing_firmware:
             existing_firmware.filename = filename
@@ -1348,7 +1348,7 @@ def upload_firmware():
             firmware = Firmware(
                 version=version_str,
                 filename=filename,
-                file_path=filepath,
+                file_path=filepath, 
                 file_size=file_size,
                 sha256=sha256,
                 release_notes=release_notes,
@@ -1391,7 +1391,7 @@ def upload_firmware():
         return jsonify({
             'error': f'Firmware version {version_str} already exists'
         }), 409
-
+    
     except Exception as e:
         logger.error(f"Error uploading firmware: {e}", exc_info=True)
         db.session.rollback()
@@ -1520,7 +1520,7 @@ def delete_firmware(firmware_id):
 def trigger_update():
     """
     특정 차량에 업데이트 명령 전송 (MQTT) -> 관리자가
-
+    
     Request Body:
         {
             "vehicle_id": "vehicle_001",
@@ -1529,15 +1529,15 @@ def trigger_update():
     """
     try:
         data = request.get_json()
-
+        
         if not data or 'vehicle_id' not in data:
             return jsonify({'error': 'vehicle_id is required'}), 400
-
+        
         vehicle_id = data['vehicle_id']
         _probe_local_devices_once(force=True)
         target_version = str(data.get('version') or '').strip() or None
         force_trigger = parse_bool(data.get('force'), default=False)
-
+        
         # 특정 버전이 지정되면 active 여부와 무관하게 해당 버전을 사용한다.
         # (대시보드에서 이전 버전/동일 버전 재설치를 허용하기 위함)
         if target_version:
@@ -1549,7 +1549,7 @@ def trigger_update():
                 }), 404
         else:
             firmware = _pick_latest_active_firmware()
-
+        
         if not firmware:
             return jsonify({'error': 'No active firmware found'}), 404
 
@@ -1601,7 +1601,7 @@ def trigger_update():
                     'hint': 'Set force=true to bypass this check.',
                     'cmd_topic': _format_cmd_topic(vehicle_id),
                 }), 409
-
+        
         announced, release_id, trigger_note = _announce_update_to_vehicle(vehicle, vehicle_id, firmware)
         if not announced:
             return jsonify({
@@ -1620,7 +1620,7 @@ def trigger_update():
             'status': 'approval_pending',
             'message': trigger_note,
         })
-
+    
     except Exception as e:
         logger.error(f"Error triggering update: {e}", exc_info=True)
         return jsonify({'error': 'Internal server error'}), 500
@@ -2119,13 +2119,13 @@ def list_firmware():
     """펌웨어 목록 조회"""
     try:
         active_only = request.args.get('active_only', 'false').lower() == 'true'
-
+        
         query = Firmware.query
         if active_only:
             query = query.filter_by(is_active=True)
-
+        
         firmwares = query.order_by(Firmware.created_at.desc()).all()
-
+        
         return jsonify({
             'firmware': [f.to_dict() for f in firmwares],
             'total': len(firmwares)
@@ -2143,7 +2143,7 @@ def shutdown_session(exception=None):
 
 if __name__ == '__main__':
     initialize_server_runtime()
-
+    
     # 서버 시작
     logger.info(f"Starting OTA Server on {Config.HOST}:{Config.PORT}")
     app.run(

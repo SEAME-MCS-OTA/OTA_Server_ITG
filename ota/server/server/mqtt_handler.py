@@ -49,7 +49,7 @@ def normalize_completed_status_by_version(
 
 class MQTTHandler:
     """MQTT 메시지 처리 핸들러"""
-
+    
     def __init__(
         self,
         app_context,
@@ -64,10 +64,10 @@ class MQTTHandler:
         self.client: Optional[mqtt.Client] = None
         self.connected = False
         self._lock = threading.Lock()
-
+        
         # MQTT 클라이언트 초기화
         self._init_client()
-
+    
     def _init_client(self):
         """MQTT 클라이언트 초기화"""
         try:
@@ -86,7 +86,7 @@ class MQTTHandler:
                     self.client = mqtt.Client(**kwargs)
             else:
                 self.client = mqtt.Client(**kwargs)
-
+            
             # 콜백 설정
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
@@ -109,25 +109,25 @@ class MQTTHandler:
                     self.client.tls_set()
                 if Config.MQTT_TLS_INSECURE:
                     self.client.tls_insecure_set(True)
-
+            
             # 인증 설정 (있는 경우)
             if Config.MQTT_USERNAME and Config.MQTT_PASSWORD:
                 self.client.username_pw_set(
                     Config.MQTT_USERNAME,
                     Config.MQTT_PASSWORD
                 )
-
+            
             logger.info(
                 "MQTT client initialized transport=%s ws_path=%s tls=%s",
                 Config.MQTT_TRANSPORT,
                 Config.MQTT_WS_PATH if Config.MQTT_TRANSPORT == "websockets" else "-",
                 "on" if Config.MQTT_TLS_ENABLED else "off",
             )
-
+            
         except Exception as e:
             logger.error(f"Failed to initialize MQTT client: {e}")
             raise
-
+    
     def connect(self):
         """MQTT 브로커에 연결"""
         try:
@@ -142,11 +142,11 @@ class MQTTHandler:
             # 백그라운드 루프 시작
             self.client.loop_start()
             logger.info("MQTT connection initiated")
-
+            
         except Exception as e:
             logger.error(f"Failed to connect to MQTT broker: {e}")
             raise
-
+    
     def disconnect(self):
         """MQTT 브로커 연결 해제"""
         if self.client:
@@ -154,13 +154,13 @@ class MQTTHandler:
             self.client.disconnect()
             self.connected = False
             logger.info("MQTT client disconnected")
-
+    
     def _on_connect(self, client, userdata, flags, rc):
         """연결 성공 콜백"""
         if rc == 0:
             self.connected = True
             logger.info("Successfully connected to MQTT broker")
-
+            
             # 모든 차량의 status/progress 토픽 구독
             # 와일드카드 사용: ota/+/status, ota/+/progress
             topics = [
@@ -170,14 +170,14 @@ class MQTTHandler:
             register_topic = str(getattr(Config, "MQTT_TOPIC_VEHICLE_REGISTER", "") or "").strip()
             if register_topic:
                 topics.append((register_topic, Config.MQTT_QOS))
-
+            
             for topic, qos in topics:
                 result = client.subscribe(topic, qos)
                 logger.info(f"Subscribed to topic: {topic} with QoS {qos}, result: {result}")
         else:
             logger.error(f"Failed to connect to MQTT broker, return code: {rc}")
             self.connected = False
-
+    
     def _on_disconnect(self, client, userdata, rc):
         """연결 해제 콜백"""
         self.connected = False
@@ -185,13 +185,13 @@ class MQTTHandler:
             logger.warning(f"Unexpected MQTT disconnection, return code: {rc}")
         else:
             logger.info("MQTT client disconnected cleanly")
-
+    
     def _on_message(self, client, userdata, msg):
         """메시지 수신 콜백"""
         try:
             topic = msg.topic
             payload = msg.payload.decode('utf-8')
-
+            
             logger.info(f"Received message on topic '{topic}': {payload}")
 
             try:
@@ -199,7 +199,7 @@ class MQTTHandler:
             except json.JSONDecodeError as e:
                 logger.error(f"Failed to parse JSON payload: {e}")
                 return
-
+            
             register_topic = str(getattr(Config, "MQTT_TOPIC_VEHICLE_REGISTER", "") or "").strip()
             if register_topic and topic == register_topic:
                 self._handle_register_message(data)
@@ -210,10 +210,10 @@ class MQTTHandler:
             if len(parts) != 3 or parts[0] != 'ota':
                 logger.warning(f"Invalid topic format: {topic}")
                 return
-
+            
             vehicle_id = parts[1]
             msg_type = parts[2]  # status or progress
-
+            
             # 메시지 타입별 처리
             if msg_type == 'status':
                 self._handle_status_message(vehicle_id, data)
@@ -221,7 +221,7 @@ class MQTTHandler:
                 self._handle_progress_message(vehicle_id, data)
             else:
                 logger.warning(f"Unknown message type: {msg_type}")
-
+                
         except Exception as e:
             logger.error(f"Error processing MQTT message: {e}", exc_info=True)
 
@@ -289,11 +289,11 @@ class MQTTHandler:
         db.session.add(vehicle)
         logger.info(f"Registered new vehicle from MQTT: {vehicle_id}")
         return vehicle
-
+    
     def _handle_status_message(self, vehicle_id: str, data: dict):
         """
         Status 메시지 처리
-
+        
         Payload 예시:
         {
             "vehicle_id": "vehicle_001",
@@ -314,11 +314,11 @@ class MQTTHandler:
                         or data.get('ip')
                         or ''
                     ).strip()
-
+                    
                     if not incoming_status or not target_version:
                         logger.warning(f"Missing required fields in status message: {data}")
                         return
-
+                    
                     # Vehicle upsert + status 반영
                     vehicle = self._upsert_vehicle(vehicle_id, default_status=incoming_status)
                     prev_version = vehicle.current_version
@@ -381,18 +381,18 @@ class MQTTHandler:
                             source="mqtt_status",
                             status_payload=data,
                         )
-
+                        
                 except Exception as e:
                     db.session.rollback()
                     logger.error(f"Database error in status handler: {e}", exc_info=True)
-
+                    
         except Exception as e:
             logger.error(f"Error in status message handler: {e}", exc_info=True)
-
+    
     def _handle_progress_message(self, vehicle_id: str, data: dict):
         """
         Progress 메시지 처리
-
+        
         Payload 예시:
         {
             "vehicle_id": "vehicle_001",
@@ -412,11 +412,11 @@ class MQTTHandler:
                         or data.get('ip')
                         or ''
                     ).strip()
-
+                    
                     if target_version is None:
                         logger.warning(f"Missing target_version in progress message: {data}")
                         return
-
+                    
                     # Vehicle upsert + heartbeat 갱신
                     vehicle = self._upsert_vehicle(vehicle_id, default_status='downloading')
                     vehicle.last_seen = datetime.utcnow()
@@ -428,7 +428,7 @@ class MQTTHandler:
                         vehicle_id=vehicle_id,
                         target_version=target_version
                     ).order_by(UpdateHistory.started_at.desc()).first()
-
+                    
                     if history:
                         history.progress = min(100, max(0, progress))  # 0-100 범위 제한
                         if message:
@@ -449,18 +449,18 @@ class MQTTHandler:
                         f"Updated progress for vehicle {vehicle_id}: "
                         f"{progress}% (version {target_version})"
                     )
-
+                        
                 except Exception as e:
                     db.session.rollback()
                     logger.error(f"Database error in progress handler: {e}", exc_info=True)
-
+                    
         except Exception as e:
             logger.error(f"Error in progress message handler: {e}", exc_info=True)
-
+    
     def publish_update_command(self, vehicle_id: str, firmware_info: dict, ota_id: str = "") -> bool:
         """
         차량에 업데이트 명령 발행
-
+        
         Args:
             vehicle_id: 차량 ID
             firmware_info: 펌웨어 정보 딕셔너리
@@ -471,14 +471,14 @@ class MQTTHandler:
                     "size": 123456,
                     "release_notes": "..."
                 }
-
+        
         Returns:
             bool: 발행 성공 여부
         """
         if not self.connected:
             logger.error("Cannot publish: MQTT client not connected")
             return False
-
+        
         try:
             topic = Config.MQTT_TOPIC_CMD.format(vehicle_id=vehicle_id)
             payload_obj = {
@@ -489,13 +489,13 @@ class MQTTHandler:
             if ota_id:
                 payload_obj["ota_id"] = str(ota_id).strip()
             payload = json.dumps(payload_obj)
-
+            
             # QoS 2로 발행 (Exactly Once)
             result = self.client.publish(topic, payload, qos=Config.MQTT_QOS)
-
+            
             # 발행 대기 (blocking)
             result.wait_for_publish()
-
+            
             if result.rc == mqtt.MQTT_ERR_SUCCESS:
                 logger.info(
                     "Published update command to %s: %s ota_id=%s",
@@ -507,7 +507,7 @@ class MQTTHandler:
             else:
                 logger.error(f"Failed to publish update command: {result.rc}")
                 return False
-
+                
         except Exception as e:
             logger.error(f"Error publishing update command: {e}", exc_info=True)
             return False
@@ -544,7 +544,7 @@ class MQTTHandler:
     def publish_release_announcement(self, firmware_info: dict) -> bool:
         # Backward-compatible alias for mixed app/mqtt_handler deployments.
         return self.publish_release_announce(firmware_info)
-
+    
     def is_connected(self) -> bool:
         """연결 상태 확인"""
         return self.connected

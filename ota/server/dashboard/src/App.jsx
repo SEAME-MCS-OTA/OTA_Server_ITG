@@ -1114,7 +1114,7 @@ const OTADashboard = () => {
                     </p>
                     <p className="text-sm text-gray-500 mt-0.5">
                       {llmEnabled
-                        ? 'Claude API analyzes OTA logs for security anomalies. REJECT blocks slot switch.'
+                        ? 'Claude API analyzes OTA logs for security anomalies. REJECT blocks slot switch. CONDITIONAL_APPROVE allows update with warnings.'
                         : 'LLM disabled: logs are saved but updates auto-APPROVE (RAUC check only).'}
                     </p>
                   </div>
@@ -1136,7 +1136,7 @@ const OTADashboard = () => {
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
                 <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
                   <p className="text-sm text-gray-600">Total Verifications</p>
                   <p className="text-3xl font-bold text-gray-900 mt-1">{llmResults.length}</p>
@@ -1157,6 +1157,15 @@ const OTADashboard = () => {
                   </div>
                   <p className="text-3xl font-bold text-red-600 mt-1">
                     {llmResults.filter((r) => r.decision === 'REJECT').length}
+                  </p>
+                </div>
+                <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
+                  <div className="flex items-center gap-2">
+                    <AlertCircle className="w-5 h-5 text-amber-600" />
+                    <p className="text-sm text-gray-600">CONDITIONAL</p>
+                  </div>
+                  <p className="text-3xl font-bold text-amber-600 mt-1">
+                    {llmResults.filter((r) => r.decision === 'CONDITIONAL_APPROVE').length}
                   </p>
                 </div>
                 <div className="bg-white rounded-lg shadow p-6 border border-gray-200">
@@ -1222,12 +1231,18 @@ const OTADashboard = () => {
                                   className={`px-3 py-1 text-sm font-bold rounded-full ${
                                     r.decision === 'APPROVE'
                                       ? 'bg-green-100 text-green-800'
-                                      : 'bg-red-100 text-red-800'
+                                      : r.decision === 'CONDITIONAL_APPROVE'
+                                        ? 'bg-amber-100 text-amber-800'
+                                        : 'bg-red-100 text-red-800'
                                   }`}
                                 >
                                   {r.decision === 'APPROVE' ? (
                                     <span className="flex items-center gap-1">
                                       <ShieldCheck className="w-3.5 h-3.5" /> APPROVE
+                                    </span>
+                                  ) : r.decision === 'CONDITIONAL_APPROVE' ? (
+                                    <span className="flex items-center gap-1">
+                                      <AlertCircle className="w-3.5 h-3.5" /> CONDITIONAL_APPROVE
                                     </span>
                                   ) : (
                                     <span className="flex items-center gap-1">
@@ -1259,7 +1274,7 @@ const OTADashboard = () => {
 
                               {r.ota_log && Object.keys(r.ota_log).length > 0 && (
                                 <div className="ml-7 p-4 bg-blue-50 rounded-lg border border-blue-200">
-                                  <h4 className="text-sm font-semibold text-blue-800 mb-2">Client OTA Log</h4>
+                                  <h4 className="text-sm font-semibold text-blue-800 mb-2">LLM Input Log</h4>
                                   <pre className="text-xs text-blue-900 whitespace-pre-wrap font-mono bg-white p-3 rounded border border-blue-200 max-h-96 overflow-auto">
                                     {JSON.stringify(r.ota_log, null, 2)}
                                   </pre>
