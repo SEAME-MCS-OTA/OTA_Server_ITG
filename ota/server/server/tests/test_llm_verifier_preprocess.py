@@ -20,7 +20,10 @@ from llm_verifier import (  # noqa: E402
 class LLMVerifierPreprocessTests(unittest.TestCase):
     def test_record_only_result_keeps_gate_log_visible(self):
         import llm_verifier  # noqa: E402
-        import app as app_module  # noqa: E402
+        try:
+            import app as app_module  # noqa: E402
+        except ModuleNotFoundError as exc:
+            self.skipTest(f"app dependencies missing: {exc.name}")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             original_db_path = llm_verifier._VERIFICATION_DB_PATH
@@ -115,7 +118,7 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
             finally:
                 llm_verifier._VERIFICATION_DB_PATH = original_db_path
 
-    def test_preprocess_returns_clean_v2_payload(self):
+    def test_preprocess_returns_clean_v3_payload(self):
         raw = {
             "schema_version": "ota-verify-v2",
             "environment": "lab",
@@ -264,8 +267,17 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
 
         processed = preprocess_log(raw)
 
-        self.assertEqual(set(processed.keys()), {"schema_version", "environment", "rule_check_results", "context_data"})
-        self.assertEqual(processed["schema_version"], "ota-verify-v2")
+        self.assertEqual(
+            set(processed.keys()),
+            {
+                "schema_version",
+                "environment",
+                "rule_check_results",
+                "pre_computed_signals",
+                "context_data",
+            },
+        )
+        self.assertEqual(processed["schema_version"], "ota-verify-v3")
         self.assertNotIn("timestamp", processed)
         self.assertNotIn("normalized_from_schema_version", processed)
 
@@ -310,6 +322,16 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
         self.assertEqual(certificate_chain["days_until_expiry"], 20)
         self.assertTrue(certificate_chain["expires_within_30_days"])
 
+        signals = processed["pre_computed_signals"]
+        self.assertTrue(signals["B_R1"])
+        self.assertFalse(signals["metadata_complete_false_on_booted_slot"])
+        self.assertTrue(signals["version_skips_in_window_gt_zero"])
+        self.assertTrue(signals["build_server_info_empty"])
+        self.assertTrue(signals["cert_expires_within_30_days"])
+        self.assertEqual(signals["transfer_C1"]["status"], "PRECONDITION_NOT_MET")
+        self.assertEqual(signals["transfer_C2"]["status"], "PRECONDITION_NOT_MET")
+        self.assertEqual(signals["transfer_C3"]["status"], "PRECONDITION_NOT_MET")
+
     def test_extract_json_object_handles_markdown_wrapped_json(self):
         payload = _extract_json_object(
             """```json
@@ -338,13 +360,26 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
                 },
                 "causal_analysis": {
                     "hypothesis": "Network interference affected bundle transfer.",
-                    "triggered_hc": None,
+                    "triggered_source": None,
                     "supporting_fields": ["context_data.transfer_metrics.retry_ratio_percent"],
                     "alternative_hypothesis": "Operational network instability",
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
                 },
                 "recommended_actions": ["Monitor the next transfer and inspect network telemetry."],
             },
             raw_response='{"decision":"CONDITIONAL_APPROVE"}',
+            input_payload={
+                "context_data": {
+                    "transfer_metrics": {
+                        "retry_ratio_percent": 10,
+                    },
+                },
+            },
         )
 
         self.assertEqual(normalized["decision"], "CONDITIONAL_APPROVE")
@@ -357,7 +392,101 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
             normalized["analysis"]["C_transfer_anomaly"],
             "Retry ratio exceeded baseline.",
         )
-        self.assertIsNone(normalized["causal_analysis"]["triggered_hc"])
+        self.assertIsNone(normalized["causal_analysis"]["triggered_source"])
+        self.assertEqual(
+            normalized["causal_analysis"]["injection_record"]["injection_type"],
+            "none",
+        )
+
+    def test_normalize_llm_json_result_forces_reject_on_precomputed_reject_signal(self):
+        normalized = _normalize_llm_json_result(
+            {
+                "decision": "APPROVE",
+                "summary": "Clean update.",
+                "warnings": [],
+                "analysis": {
+                    "A_log_interpretation": None,
+                    "B_slot_verification": None,
+                    "C_transfer_anomaly": None,
+                    "D_build_provenance": None,
+                    "E_mqtt_integrity": None,
+                    "F_system_resources": None,
+                    "G_deployment_path": None,
+                    "H_compound_pattern": None,
+                },
+                "causal_analysis": {
+                    "hypothesis": None,
+                    "triggered_source": None,
+                    "supporting_fields": [],
+                    "alternative_hypothesis": None,
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
+                },
+                "recommended_actions": [],
+            },
+            raw_response='{"decision":"APPROVE"}',
+            input_payload={
+                "pre_computed_signals": {
+                    "B_R1": True,
+                    "B_R2": False,
+                    "B_R3": False,
+                    "mqtt_command_mismatch": False,
+                    "injection_prescreen_hits": [],
+                },
+            },
+        )
+
+        self.assertEqual(normalized["decision"], "REJECT")
+        self.assertEqual(normalized["causal_analysis"]["triggered_source"], "B-R1")
+        self.assertIn("llm_precomputed_reject_override", normalized["warnings"])
+
+    def test_normalize_llm_json_result_warns_on_invalid_supporting_field_path(self):
+        normalized = _normalize_llm_json_result(
+            {
+                "decision": "CONDITIONAL_APPROVE",
+                "summary": "Manual review recommended.",
+                "warnings": [],
+                "analysis": {
+                    "A_log_interpretation": "Suspicious log context.",
+                    "B_slot_verification": None,
+                    "C_transfer_anomaly": None,
+                    "D_build_provenance": None,
+                    "E_mqtt_integrity": None,
+                    "F_system_resources": None,
+                    "G_deployment_path": None,
+                    "H_compound_pattern": None,
+                },
+                "causal_analysis": {
+                    "hypothesis": "Unknown log context requires review.",
+                    "triggered_source": None,
+                    "supporting_fields": ["context_data.logs.missing_field"],
+                    "alternative_hypothesis": "Operational logging artifact",
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
+                },
+                "recommended_actions": ["Review the raw log context."],
+            },
+            raw_response='{"decision":"CONDITIONAL_APPROVE"}',
+            input_payload={
+                "context_data": {
+                    "logs": {},
+                },
+            },
+        )
+
+        self.assertEqual(normalized["decision"], "CONDITIONAL_APPROVE")
+        self.assertIn(
+            "invalid_supporting_field:context_data.logs.missing_field",
+            normalized["warnings"],
+        )
 
     def test_normalize_llm_json_result_rejects_invalid_schema(self):
         normalized = _normalize_llm_json_result(

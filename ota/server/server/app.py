@@ -1662,7 +1662,7 @@ def _normalize_ota_verify_payload(ota_log: dict) -> dict:
     if all(field in ota_log for field in ("firmware_metadata", "process_log", "device_state")):
         return ota_log
 
-    if ota_log.get("schema_version") != "ota-verify-v2":
+    if ota_log.get("schema_version") not in ("ota-verify-v2", "ota-verify-v3"):
         return ota_log
 
     context = ota_log.get("context_data") or {}
@@ -1750,7 +1750,8 @@ def _verify_payload_all_passed(payload: dict) -> bool:
         if not isinstance(item, dict):
             return False
         status = str(item.get("status") or "").strip().upper()
-        if status != "PASSED":
+        fail_action = str(item.get("fail_action") or "").strip().upper()
+        if status != "PASSED" and fail_action == "REJECT":
             return False
     return True
 
@@ -1775,7 +1776,9 @@ def _verify_collect_non_passing_rules(payload: dict) -> list[str]:
     for name, item in items:
         if not isinstance(item, dict):
             continue
-        if str(item.get("status") or "").strip().upper() != "PASSED":
+        status = str(item.get("status") or "").strip().upper()
+        fail_action = str(item.get("fail_action") or "").strip().upper()
+        if status != "PASSED" and fail_action == "REJECT":
             failed.append(str(name))
     return failed
 
@@ -1792,7 +1795,7 @@ def verify_ota_update():
             return jsonify({"error": "No JSON body provided"}), 400
         verify_mode = str(request.headers.get("X-OTA-Verify-Mode") or "gate").strip().lower()
 
-        if ota_log_raw.get("schema_version") == "ota-verify-v2":
+        if ota_log_raw.get("schema_version") in ("ota-verify-v2", "ota-verify-v3"):  # v3 added 2026-05-08
             required_fields = ["rule_check_results", "context_data"]
             for field in required_fields:
                 if field not in ota_log_raw:
@@ -1820,8 +1823,15 @@ def verify_ota_update():
                 "analysis": {},
                 "causal_analysis": {
                     "hypothesis": None,
+                    "triggered_source": None,
                     "supporting_fields": [],
                     "alternative_hypothesis": None,
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
                 },
                 "recommended_actions": [],
                 "recommendations": [],
@@ -1841,8 +1851,15 @@ def verify_ota_update():
                 "analysis": {},
                 "causal_analysis": {
                     "hypothesis": "Deterministic rules rejected the payload before LLM review.",
+                    "triggered_source": None,
                     "supporting_fields": list(non_passing_rules),
                     "alternative_hypothesis": None,
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
                 },
                 "recommended_actions": ["Inspect the failing deterministic rule results."],
                 "recommendations": ["Inspect the failing deterministic rule results."],
@@ -1859,8 +1876,15 @@ def verify_ota_update():
                 "analysis": {},
                 "causal_analysis": {
                     "hypothesis": None,
+                    "triggered_source": None,
                     "supporting_fields": [],
                     "alternative_hypothesis": None,
+                    "injection_record": {
+                        "injection_type": "none",
+                        "injection_scope": "none",
+                        "detected_field": None,
+                        "matched_pattern": None,
+                    },
                 },
                 "recommended_actions": [],
                 "recommendations": [],
@@ -1892,8 +1916,15 @@ def verify_ota_update():
             "analysis": result.get("analysis", {}),
             "causal_analysis": result.get("causal_analysis", {
                 "hypothesis": None,
+                "triggered_source": None,
                 "supporting_fields": [],
                 "alternative_hypothesis": None,
+                "injection_record": {
+                    "injection_type": "none",
+                    "injection_scope": "none",
+                    "detected_field": None,
+                    "matched_pattern": None,
+                },
             }),
             "recommended_actions": result.get("recommended_actions", result.get("recommendations", [])),
             "recommendations": result.get("recommendations", result.get("recommended_actions", [])),
@@ -1943,7 +1974,7 @@ def list_llm_results():
             ota_log = result_row.get('ota_log') or {}
             if not isinstance(ota_log, dict):
                 return ''
-            if ota_log.get('schema_version') == 'ota-verify-v2':
+            if ota_log.get('schema_version') in ('ota-verify-v2', 'ota-verify-v3'):
                 commands = (((ota_log.get('context_data') or {}).get('mqtt_analysis') or {}).get('commands') or [])
             else:
                 commands = (((ota_log.get('process_log') or {}).get('mqtt_command_history') or []))
