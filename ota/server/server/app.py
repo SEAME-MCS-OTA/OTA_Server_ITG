@@ -340,27 +340,21 @@ def normalize_completed_status_by_version(
     message: str = "",
 ) -> tuple[str, str]:
     """
-    서버 성공 판정 보정:
-    - completed 수신 시, 이전 버전과 target_version이 동일하면 실패로 강등한다.
-    - 비교 기준값이 없는 경우(prev_version empty)는 기존 completed를 유지한다.
+    Preserve the client-reported terminal status.
+
+    Same-version OTA can be valid when the user explicitly forced a reinstall.
+    The trigger path already decides whether same-version updates are allowed, so
+    result handling must not downgrade a completed report only because the
+    version string is unchanged. Malformed terminal reports are still
+    fail-closed when the target version is missing.
     """
     status_norm = str(status or "").strip().lower()
-    if status_norm != "completed":
-        return status_norm, str(message or "")
-
-    prev = str(prev_version or "").strip()
-    target = str(target_version or "").strip()
     msg = str(message or "")
-
-    if not target:
+    target = str(target_version or "").strip()
+    if status_norm == "completed" and not target:
         reason = "target_version missing"
         return "failed", f"{msg} | {reason}".strip(" |")
-
-    if prev and prev == target:
-        reason = f"version unchanged: {prev}"
-        return "failed", f"{msg} | {reason}".strip(" |")
-
-    return "completed", msg
+    return status_norm, msg
 
 
 def parse_bool(value, default: bool = False) -> bool:
