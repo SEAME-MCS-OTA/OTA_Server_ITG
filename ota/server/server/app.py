@@ -29,6 +29,7 @@ from models import db, Vehicle, Firmware, UpdateHistory
 from mqtt_handler import MQTTHandler
 from monitoring_reporter import publish_update_result, should_report_final_status
 from llm_verifier import (
+    apply_longitudinal_escalation,
     call_llm_verification,
     get_llm_log_path,
     preprocess_log,
@@ -1861,6 +1862,7 @@ def verify_ota_update():
             }
         elif _llm_enabled:
             result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
+            result = apply_longitudinal_escalation(preprocessed, result)
         else:
             result = {
                 "decision": "APPROVE",

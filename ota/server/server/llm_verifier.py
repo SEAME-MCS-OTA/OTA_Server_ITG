@@ -1251,6 +1251,22 @@ def _precomputed_reject_source(input_payload: Optional[Dict[str, Any]]) -> Optio
     return None
 
 
+_PRECOMPUTED_REJECT_SUPPORTING_PATHS = {
+    "B-R1": "pre_computed_signals.B_R1",
+    "B-R2": "pre_computed_signals.B_R2",
+    "B-R3": "pre_computed_signals.B_R3",
+    "MQTT_MISMATCH": "pre_computed_signals.mqtt_command_mismatch",
+    "INJECTION_STANDALONE": "pre_computed_signals.injection_prescreen_hits",
+}
+
+
+def _precomputed_reject_supporting_path(reject_source: str) -> str:
+    return _PRECOMPUTED_REJECT_SUPPORTING_PATHS.get(
+        reject_source,
+        "pre_computed_signals." + str(reject_source or "").replace("-", "_"),
+    )
+
+
 def _json_path_exists(payload: Optional[Dict[str, Any]], path: str) -> bool:
     if not isinstance(payload, dict):
         return True
@@ -1456,11 +1472,7 @@ def _normalize_llm_json_result(
         causal_analysis = {
             "hypothesis": "A deterministic first-pass reject signal was present in pre_computed_signals.",
             "triggered_source": reject_source,
-            "supporting_fields": [
-                "pre_computed_signals.injection_prescreen_hits"
-                if reject_source == "INJECTION_STANDALONE"
-                else "pre_computed_signals." + reject_source.replace("-", "_")
-            ],
+            "supporting_fields": [_precomputed_reject_supporting_path(reject_source)],
             "alternative_hypothesis": None,
             "injection_record": causal_analysis.get("injection_record", _empty_causal_analysis()["injection_record"]),
         }
@@ -1707,6 +1719,129 @@ def _decision_rank(decision: str) -> int:
     if normalized == "APPROVE":
         return 1
     return 0
+
+
+def _has_release_note_semantic_warning(result: dict) -> bool:
+    warnings = result.get("warnings")
+    if isinstance(warnings, list):
+        for warning in warnings:
+            if "release_notes_semantic" in str(warning or "").lower():
+                return True
+
+    reason = str(result.get("reason") or result.get("summary") or "").lower()
+    if "release notes" in reason and ("semantic" in reason or "off-topic" in reason or "anomal" in reason):
+        return True
+
+    analysis = result.get("analysis")
+    if isinstance(analysis, dict):
+        mqtt_text = str(analysis.get("E_mqtt_integrity") or "").lower()
+        if "release notes" in mqtt_text and ("semantic" in mqtt_text or "off-topic" in mqtt_text or "anomal" in mqtt_text):
+            return True
+
+    return False
+
+
+def apply_longitudinal_escalation(ota_log: dict, result: dict) -> dict:
+    """Escalate repeated low-confidence release-note anomalies for one vehicle/version.
+
+    The LLM may classify a single odd release note as CONDITIONAL_APPROVE. If
+    the same vehicle and target version already had such a conditional result,
+    this deterministic postprocess treats the recurrence as a longitudinal
+    pattern and blocks the update.
+    """
+    if not isinstance(result, dict):
+        return result
+    if str(result.get("decision") or "").strip().upper() != "CONDITIONAL_APPROVE":
+        return result
+    if not _has_release_note_semantic_warning(result):
+        return result
+
+    vehicle_id, _current_version, new_version = _extract_vehicle_versions(ota_log)
+    if not vehicle_id or vehicle_id == "unknown" or not new_version:
+        return result
+
+    try:
+        conn = _get_verification_db()
+        conn.row_factory = sqlite3.Row
+        prior = conn.execute(
+            """
+            SELECT id, reason, raw_response, created_at
+              FROM verification_results
+             WHERE verify_mode = 'gate'
+               AND vehicle_id = ?
+               AND new_version = ?
+               AND decision = 'CONDITIONAL_APPROVE'
+             ORDER BY id DESC
+             LIMIT 10
+            """,
+            (vehicle_id, new_version),
+        ).fetchall()
+        conn.close()
+    except Exception as exc:
+        logger.warning("Longitudinal escalation lookup failed: %s", exc)
+        return result
+
+    matching_prior = []
+    for row in prior:
+        row_result = {
+            "warnings": [],
+            "reason": row["reason"],
+            "summary": row["reason"],
+            "analysis": {},
+        }
+        raw_response = row["raw_response"]
+        if raw_response:
+            try:
+                parsed = json.loads(raw_response)
+                if isinstance(parsed, dict):
+                    row_result.update(parsed)
+            except Exception:
+                pass
+        if _has_release_note_semantic_warning(row_result):
+            matching_prior.append(row)
+
+    if not matching_prior:
+        return result
+
+    warnings = list(result.get("warnings") or [])
+    warnings.append("longitudinal_low_confidence_release_note_escalation")
+    summary = (
+        "Repeated low-confidence release-note semantic anomaly for the same "
+        f"vehicle/version: vehicle={vehicle_id} target={new_version}"
+    )
+    causal = result.get("causal_analysis")
+    if not isinstance(causal, dict):
+        causal = _empty_causal_analysis()
+    causal = dict(causal)
+    supporting = list(causal.get("supporting_fields") or [])
+    for field in (
+        "context_data.mqtt_analysis.release_notes",
+        "context_data.recent_update_signals",
+    ):
+        if field not in supporting:
+            supporting.append(field)
+    causal.update({
+        "hypothesis": summary,
+        "triggered_source": "LONGITUDINAL_LOW_CONFIDENCE_INJECTION",
+        "supporting_fields": supporting,
+        "alternative_hypothesis": causal.get("alternative_hypothesis"),
+        "injection_record": causal.get("injection_record", _empty_causal_analysis()["injection_record"]),
+    })
+
+    actions = list(result.get("recommended_actions") or result.get("recommendations") or [])
+    actions.append("Block this OTA and review prior conditional approvals for the same vehicle/version.")
+
+    updated = dict(result)
+    updated.update({
+        "decision": "REJECT",
+        "summary": summary,
+        "reason": summary,
+        "warnings": warnings,
+        "causal_analysis": causal,
+        "recommended_actions": actions,
+        "recommendations": list(actions),
+    })
+    return updated
 
 
 def save_verification_result(ota_log: dict, result: dict, verify_mode: str = "gate"):

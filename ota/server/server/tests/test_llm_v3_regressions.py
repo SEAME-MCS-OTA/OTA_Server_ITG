@@ -1,5 +1,7 @@
+import copy
 import os
 import sys
+import tempfile
 import unittest
 
 
@@ -8,7 +10,12 @@ SERVER_DIR = os.path.abspath(os.path.join(HERE, ".."))
 if SERVER_DIR not in sys.path:
     sys.path.insert(0, SERVER_DIR)
 
-from llm_verifier import _normalize_llm_json_result, preprocess_log  # noqa: E402
+from llm_verifier import (  # noqa: E402
+    _normalize_llm_json_result,
+    apply_longitudinal_escalation,
+    preprocess_log,
+    save_verification_result,
+)
 
 
 ANALYSIS_EMPTY = {
@@ -229,8 +236,42 @@ class LLMV3RegressionTests(unittest.TestCase):
 
         self.assertEqual(normalized["decision"], "REJECT")
         self.assertEqual(normalized["causal_analysis"]["triggered_source"], "INJECTION_STANDALONE")
+        self.assertEqual(
+            normalized["causal_analysis"]["supporting_fields"],
+            ["pre_computed_signals.injection_prescreen_hits"],
+        )
 
-    def test_34_subtle_injection_llm_reject_schema_is_accepted(self):
+    def test_34_mqtt_mismatch_reject_uses_payload_signal_path(self):
+        payload = base_payload()
+        command = payload["context_data"]["mqtt_analysis"]["commands"][0]
+        conflicting = copy.deepcopy(command)
+        conflicting["parsed_command"]["ota_id"] = command["parsed_command"]["ota_id"]
+        conflicting.setdefault("payload", {})["ota_id"] = command["parsed_command"]["ota_id"]
+        conflicting["parsed_command"]["target_version"] = "3.5.7"
+        conflicting["payload"]["firmware"]["version"] = "3.5.8"
+        payload["context_data"]["mqtt_analysis"]["commands"].append(conflicting)
+
+        processed = preprocess_log(payload)
+        self.assertTrue(processed["pre_computed_signals"]["mqtt_command_mismatch"])
+
+        normalized = _normalize_llm_json_result(
+            llm_result("APPROVE"),
+            raw_response='{"decision":"APPROVE"}',
+            input_payload=processed,
+        )
+
+        self.assertEqual(normalized["decision"], "REJECT")
+        self.assertEqual(normalized["causal_analysis"]["triggered_source"], "MQTT_MISMATCH")
+        self.assertEqual(
+            normalized["causal_analysis"]["supporting_fields"],
+            ["pre_computed_signals.mqtt_command_mismatch"],
+        )
+        self.assertNotIn(
+            "invalid_supporting_field:pre_computed_signals.MQTT_MISMATCH",
+            normalized["warnings"],
+        )
+
+    def test_35_subtle_injection_llm_reject_schema_is_accepted(self):
         processed = preprocess_log(base_payload())
         self.assertEqual(processed["pre_computed_signals"]["injection_prescreen_hits"], [])
 
@@ -330,6 +371,48 @@ class LLMV3RegressionTests(unittest.TestCase):
             input_payload=processed,
         )
         self.assertEqual(normalized["decision"], "CONDITIONAL_APPROVE")
+
+    def test_38_repeated_release_note_semantic_warning_escalates(self):
+        import llm_verifier  # noqa: E402
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            original_db_path = llm_verifier._VERIFICATION_DB_PATH
+            llm_verifier._VERIFICATION_DB_PATH = os.path.join(tmpdir, "llm_verification.db")
+            try:
+                previous_payload = preprocess_log(base_payload())
+                previous_result = llm_result(
+                    "CONDITIONAL_APPROVE",
+                    warnings=["E_warning_release_notes_semantic"],
+                    supporting_fields=["context_data.mqtt_analysis.release_notes"],
+                    actions=["Review release notes."],
+                )
+                previous_result["reason"] = "Release notes contain semantically anomalous content."
+                previous_result["summary"] = previous_result["reason"]
+                save_verification_result(previous_payload, previous_result, verify_mode="gate")
+
+                current_payload = preprocess_log(base_payload())
+                current_result = llm_result(
+                    "CONDITIONAL_APPROVE",
+                    warnings=["E_warning_release_notes_semantic"],
+                    supporting_fields=["context_data.mqtt_analysis.release_notes"],
+                    actions=["Review release notes."],
+                )
+                current_result["reason"] = "Release notes contain semantically anomalous content."
+                current_result["summary"] = current_result["reason"]
+
+                escalated = apply_longitudinal_escalation(current_payload, current_result)
+
+                self.assertEqual(escalated["decision"], "REJECT")
+                self.assertEqual(
+                    escalated["causal_analysis"]["triggered_source"],
+                    "LONGITUDINAL_LOW_CONFIDENCE_INJECTION",
+                )
+                self.assertIn(
+                    "longitudinal_low_confidence_release_note_escalation",
+                    escalated["warnings"],
+                )
+            finally:
+                llm_verifier._VERIFICATION_DB_PATH = original_db_path
 
 
 if __name__ == "__main__":
