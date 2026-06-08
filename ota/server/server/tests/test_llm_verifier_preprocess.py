@@ -84,7 +84,20 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
 
                 save_verification_result(
                     gate_log,
-                    {"decision": "APPROVE", "reason": "gate-pass", "raw_response": "{}"},
+                    {
+                        "decision": "APPROVE",
+                        "reason": "gate-pass",
+                        "raw_response": "{}",
+                        "llm_metrics": {
+                            "model": "claude-test",
+                            "elapsed_s": 1.25,
+                            "input_tokens": 100,
+                            "output_tokens": 25,
+                            "total_tokens": 125,
+                            "call_count": 1,
+                            "retry_count": 0,
+                        },
+                    },
                     verify_mode="gate",
                 )
                 save_verification_result(
@@ -111,6 +124,10 @@ class LLMVerifierPreprocessTests(unittest.TestCase):
                 self.assertEqual(payload["total"], 1)
                 result = payload["results"][0]
                 self.assertEqual(result["verify_mode"], "gate")
+                self.assertEqual(result["llm_metrics"]["model"], "claude-test")
+                self.assertEqual(result["llm_metrics"]["input_tokens"], 100)
+                self.assertEqual(result["llm_metrics"]["output_tokens"], 25)
+                self.assertEqual(result["llm_metrics"]["call_count"], 1)
                 self.assertEqual(
                     result["ota_log"]["context_data"]["logs"]["system_log_excerpt"],
                     "gate-log",

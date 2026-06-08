@@ -1922,6 +1922,7 @@ def verify_ota_update():
             }),
             "recommended_actions": result.get("recommended_actions", result.get("recommendations", [])),
             "recommendations": result.get("recommendations", result.get("recommended_actions", [])),
+            "llm_metrics": result.get("llm_metrics", {}) if isinstance(result.get("llm_metrics"), dict) else {},
             "timestamp": datetime.utcnow().isoformat() + "Z",
         })
 
@@ -1961,6 +1962,18 @@ def list_llm_results():
                 r['ota_log'] = preprocess_log(raw_ota_log)
             except Exception:
                 r['ota_log'] = raw_ota_log
+            r['llm_metrics'] = {
+                'model': r.get('llm_model'),
+                'elapsed_s': r.get('llm_elapsed_s'),
+                'input_tokens': r.get('llm_input_tokens'),
+                'output_tokens': r.get('llm_output_tokens'),
+                'cache_creation_input_tokens': r.get('llm_cache_creation_input_tokens'),
+                'cache_read_input_tokens': r.get('llm_cache_read_input_tokens'),
+                'total_tokens': r.get('llm_total_tokens'),
+                'call_count': r.get('llm_call_count'),
+                'retry_count': r.get('llm_retry_count'),
+                'cost_usd': r.get('llm_cost_usd'),
+            }
             r.pop('ota_log_json', None)
             results.append(r)
 

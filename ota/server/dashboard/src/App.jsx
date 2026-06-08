@@ -1272,6 +1272,15 @@ const OTADashboard = () => {
                                 </pre>
                               </div>
 
+                              {r.llm_metrics && (
+                                <div className="ml-7 p-4 bg-slate-50 rounded-lg border border-slate-200">
+                                  <h4 className="text-sm font-semibold text-slate-800 mb-2">LLM Operational Metrics</h4>
+                                  <pre className="text-xs text-slate-900 whitespace-pre-wrap font-mono bg-white p-3 rounded border border-slate-200 overflow-auto">
+                                    {JSON.stringify(r.llm_metrics, null, 2)}
+                                  </pre>
+                                </div>
+                              )}
+
                               {r.ota_log && Object.keys(r.ota_log).length > 0 && (
                                 <div className="ml-7 p-4 bg-blue-50 rounded-lg border border-blue-200">
                                   <h4 className="text-sm font-semibold text-blue-800 mb-2">LLM Input Log</h4>

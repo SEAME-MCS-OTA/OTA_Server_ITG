@@ -1323,6 +1323,98 @@ def _invalid_llm_result(message: str, raw_response: Optional[str]) -> Dict[str, 
     }
 
 
+def _int_or_none(value: Any) -> Optional[int]:
+    try:
+        if value is None:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_env(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; LLM cost will not use this value", name, raw)
+        return None
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return int(default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default=%s", name, raw, default)
+        return int(default)
+
+
+def _anthropic_retryable_errors() -> tuple:
+    if anthropic is None:
+        return tuple()
+    names = ("APITimeoutError", "APIConnectionError", "RateLimitError", "InternalServerError")
+    return tuple(cls for cls in (getattr(anthropic, name, None) for name in names) if isinstance(cls, type))
+
+
+def _usage_attr(usage: Any, name: str) -> Optional[int]:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return _int_or_none(usage.get(name))
+    return _int_or_none(getattr(usage, name, None))
+
+
+def _llm_cost_usd(metrics: Dict[str, Any]) -> Optional[float]:
+    input_price = _float_env("LLM_INPUT_PRICE_PER_MILLION")
+    output_price = _float_env("LLM_OUTPUT_PRICE_PER_MILLION")
+    cache_creation_price = _float_env("LLM_CACHE_CREATION_INPUT_PRICE_PER_MILLION")
+    cache_read_price = _float_env("LLM_CACHE_READ_INPUT_PRICE_PER_MILLION")
+    if input_price is None or output_price is None:
+        return None
+
+    cost = 0.0
+    cost += ((metrics.get("input_tokens") or 0) / 1_000_000.0) * input_price
+    cost += ((metrics.get("output_tokens") or 0) / 1_000_000.0) * output_price
+    if cache_creation_price is not None:
+        cost += ((metrics.get("cache_creation_input_tokens") or 0) / 1_000_000.0) * cache_creation_price
+    if cache_read_price is not None:
+        cost += ((metrics.get("cache_read_input_tokens") or 0) / 1_000_000.0) * cache_read_price
+    return round(cost, 8)
+
+
+def _llm_metrics(
+    *,
+    model: str,
+    elapsed_s: Optional[float],
+    usage: Any = None,
+    call_count: int = 1,
+    retry_count: int = 0,
+) -> Dict[str, Any]:
+    input_tokens = _usage_attr(usage, "input_tokens")
+    output_tokens = _usage_attr(usage, "output_tokens")
+    cache_creation = _usage_attr(usage, "cache_creation_input_tokens")
+    cache_read = _usage_attr(usage, "cache_read_input_tokens")
+    total_tokens = sum(v or 0 for v in (input_tokens, output_tokens, cache_creation, cache_read))
+    metrics = {
+        "model": str(model or ""),
+        "elapsed_s": round(float(elapsed_s), 4) if elapsed_s is not None else None,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation,
+        "cache_read_input_tokens": cache_read,
+        "total_tokens": total_tokens if total_tokens > 0 else None,
+        "call_count": int(call_count or 0),
+        "retry_count": int(retry_count or 0),
+    }
+    metrics["cost_usd"] = _llm_cost_usd(metrics)
+    return metrics
+
+
 def _normalize_llm_json_result(
     payload: Dict[str, Any],
     raw_response: Optional[str],
@@ -1419,29 +1511,64 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
         )
         if anthropic is None:
             logger.error("Anthropic SDK is not installed; rejecting LLM verification request")
-            return _invalid_llm_result(
+            result = _invalid_llm_result(
                 "Anthropic SDK not installed on server. Fail-safe REJECT.",
                 None,
             )
+            result["llm_metrics"] = _llm_metrics(
+                model=model,
+                elapsed_s=time.monotonic() - started_at,
+                usage=None,
+                call_count=0,
+                retry_count=0,
+            )
+            return result
 
-        client = anthropic.Anthropic(timeout=60.0)
+        try:
+            client = anthropic.Anthropic(timeout=60.0, max_retries=0)
+        except TypeError:
+            client = anthropic.Anthropic(timeout=60.0)
 
-        response = client.messages.create(
-            model=model,
-            max_tokens=1600,
-            temperature=_llm_temperature(),
-            system=_system_prompt(),
-            messages=[
-                {
-                    "role": "user",
-                    "content": (
-                        "Analyze the following OTA update log JSON and return only one JSON object "
-                        "that conforms to the required output schema.\n\n"
-                        f"{json.dumps(ota_log_json, indent=2, ensure_ascii=False)}"
-                    )
-                }
-            ]
-        )
+        call_count = 0
+        retry_count = 0
+        max_retries = max(0, _int_env("LLM_API_MAX_RETRIES", 2))
+        retry_delay_s = max(0.0, _float_env("LLM_API_RETRY_BASE_DELAY_SEC") or 0.5)
+        retryable_errors = _anthropic_retryable_errors()
+
+        for attempt in range(max_retries + 1):
+            try:
+                call_count += 1
+                response = client.messages.create(
+                    model=model,
+                    max_tokens=1600,
+                    temperature=_llm_temperature(),
+                    system=_system_prompt(),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": (
+                                "Analyze the following OTA update log JSON and return only one JSON object "
+                                "that conforms to the required output schema.\n\n"
+                                f"{json.dumps(ota_log_json, indent=2, ensure_ascii=False)}"
+                            )
+                        }
+                    ]
+                )
+                break
+            except retryable_errors as retry_ex:
+                if attempt >= max_retries:
+                    raise
+                retry_count += 1
+                sleep_s = min(retry_delay_s * (2 ** attempt), 5.0)
+                logger.warning(
+                    "Claude API retryable error attempt=%s/%s error=%s retry_in=%.2fs",
+                    attempt + 1,
+                    max_retries + 1,
+                    retry_ex.__class__.__name__,
+                    sleep_s,
+                )
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
 
         result_text = response.content[0].text
         parsed_payload = _extract_json_object(result_text)
@@ -1458,19 +1585,44 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
             normalized["decision"],
             elapsed,
         )
+        normalized["llm_metrics"] = _llm_metrics(
+            model=model,
+            elapsed_s=elapsed,
+            usage=getattr(response, "usage", None),
+            call_count=call_count,
+            retry_count=retry_count,
+        )
 
         return normalized
 
     except anthropic.APITimeoutError:
+        elapsed = time.monotonic() - started_at if "started_at" in locals() else None
         logger.error("Claude API timeout")
-        return _invalid_llm_result("Claude API timeout. Fail-safe REJECT.", None)
+        result = _invalid_llm_result("Claude API timeout. Fail-safe REJECT.", None)
+        result["llm_metrics"] = _llm_metrics(
+            model=model,
+            elapsed_s=elapsed,
+            usage=None,
+            call_count=call_count if "call_count" in locals() else 1,
+            retry_count=retry_count if "retry_count" in locals() else 0,
+        )
+        return result
 
     except Exception as e:
+        elapsed = time.monotonic() - started_at if "started_at" in locals() else None
         logger.error(f"LLM verification error: {e}")
-        return _invalid_llm_result(
+        result = _invalid_llm_result(
             f"LLM verification exception: {str(e)}. Fail-safe REJECT.",
             None,
         )
+        result["llm_metrics"] = _llm_metrics(
+            model=model,
+            elapsed_s=elapsed,
+            usage=None,
+            call_count=call_count if "call_count" in locals() else (1 if anthropic is not None else 0),
+            retry_count=retry_count if "retry_count" in locals() else 0,
+        )
+        return result
 
 
 # ──────────────────────────────────────────────
@@ -1511,14 +1663,37 @@ def _get_verification_db() -> sqlite3.Connection:
             raw_response TEXT,
             ota_log_json TEXT,
             verify_mode TEXT,
+            llm_model TEXT,
+            llm_elapsed_s REAL,
+            llm_input_tokens INTEGER,
+            llm_output_tokens INTEGER,
+            llm_cache_creation_input_tokens INTEGER,
+            llm_cache_read_input_tokens INTEGER,
+            llm_total_tokens INTEGER,
+            llm_call_count INTEGER,
+            llm_retry_count INTEGER,
+            llm_cost_usd REAL,
             created_at TEXT NOT NULL
         )
     """)
     columns = {row[1] for row in conn.execute("PRAGMA table_info(verification_results)").fetchall()}
-    if "ota_id" not in columns:
-        conn.execute("ALTER TABLE verification_results ADD COLUMN ota_id TEXT")
-    if "verify_mode" not in columns:
-        conn.execute("ALTER TABLE verification_results ADD COLUMN verify_mode TEXT")
+    migrations = {
+        "ota_id": "TEXT",
+        "verify_mode": "TEXT",
+        "llm_model": "TEXT",
+        "llm_elapsed_s": "REAL",
+        "llm_input_tokens": "INTEGER",
+        "llm_output_tokens": "INTEGER",
+        "llm_cache_creation_input_tokens": "INTEGER",
+        "llm_cache_read_input_tokens": "INTEGER",
+        "llm_total_tokens": "INTEGER",
+        "llm_call_count": "INTEGER",
+        "llm_retry_count": "INTEGER",
+        "llm_cost_usd": "REAL",
+    }
+    for column_name, column_type in migrations.items():
+        if column_name not in columns:
+            conn.execute(f"ALTER TABLE verification_results ADD COLUMN {column_name} {column_type}")
     conn.commit()
     return conn
 
@@ -1546,11 +1721,15 @@ def save_verification_result(ota_log: dict, result: dict, verify_mode: str = "ga
         result_decision = str(result.get("decision") or "").strip().upper()
         result_reason = result.get("reason")
         result_raw = result.get("raw_response")
+        metrics = dict(result.get("llm_metrics") or {})
 
         conn.execute(
             """INSERT INTO verification_results
-               (ota_id, vehicle_id, current_version, new_version, decision, reason, raw_response, ota_log_json, verify_mode, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               (ota_id, vehicle_id, current_version, new_version, decision, reason, raw_response, ota_log_json,
+                verify_mode, llm_model, llm_elapsed_s, llm_input_tokens, llm_output_tokens,
+                llm_cache_creation_input_tokens, llm_cache_read_input_tokens, llm_total_tokens,
+                llm_call_count, llm_retry_count, llm_cost_usd, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 ota_id,
                 vehicle_id,
@@ -1561,6 +1740,16 @@ def save_verification_result(ota_log: dict, result: dict, verify_mode: str = "ga
                 result_raw,
                 json.dumps(ota_log, ensure_ascii=False),
                 verify_mode,
+                metrics.get("model"),
+                metrics.get("elapsed_s"),
+                metrics.get("input_tokens"),
+                metrics.get("output_tokens"),
+                metrics.get("cache_creation_input_tokens"),
+                metrics.get("cache_read_input_tokens"),
+                metrics.get("total_tokens"),
+                metrics.get("call_count", 0),
+                metrics.get("retry_count", 0),
+                metrics.get("cost_usd"),
                 created_at,
             ),
         )
