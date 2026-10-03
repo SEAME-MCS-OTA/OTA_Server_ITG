@@ -11,6 +11,43 @@
 - Monitoring backend
 - Monitoring MySQL
 
+## 1단계 목표 시스템 아키텍처
+
+기존 OTA 배포·설치 흐름을 유지하고, 서버의 Claude API 기반 2차 검증을 Ethernet으로 연결한 Jetson Orin Nano의 로컬 모델로 이전한다. 모델은 LLM으로 한정하지 않는다. Gateway가 설치 여부를 판단·실행하고, 서버는 배포와 이력 저장을 담당한다.
+
+**설계 상태:** 아래는 합의된 목표 구조다. 현재 코드는 서버 `/api/ota/verify`를 통한 외부 LLM 검증을 사용한다. Jetson 호출, 결과 전달, 장애 시 보류·재시도는 아직 구현되지 않았다. 이 문서 변경은 실행 코드나 배포 설정을 바꾸지 않는다.
+
+```text
++--------------------------------------------------------------------+
+| OTA Server - Raspberry Pi                                          |
+| Dashboard | OTA API | Firmware Storage | MQTT Broker | Databases   |
++--------------------------------------------------------------------+
+       | [1] MQTT             ^ [2] MQTT          ^ [3][4] HTTPS
+       | Notice / Command     | Register /       | GET firmware
+       |                      | Request /        | POST logs, events,
+       |                      | Status / Progress| verification records
+       v                      |                  |
++--------------------------------------------------------------------+
+| Gateway - Telechips D3-G                                           |
+| OTA Client | Primary Verification | Installation Decision          |
+| RAUC A/B Update | Boot Confirmation | OP-TEE Anti-rollback         |
++--------------------------------------------------------------------+
+       | [5] Verification request                ^ [6] Result
+       | Metadata / Logs / Device status         | Decision / Reason /
+       |                                         | Model version
+       |          Ethernet - Verification API    |
+       |          (application protocol: TBD)    |
+       v                                         |
++--------------------------------------------------------------------+
+| Secondary Verifier - Jetson Orin Nano                              |
+| Verification API | On-device Model                                 |
++--------------------------------------------------------------------+
+```
+
+화살표 [3]은 HTTPS GET **요청 방향**이다. 펌웨어 본문은 서버 → Gateway의 응답으로 전달된다. MQTT와 HTTPS는 대체 관계가 아니라 메시지 종류에 따라 역할을 나눈다. [5][6]은 요청·응답의 논리적 방향이며 Ethernet 자체가 API 프로토콜을 뜻하지 않는다.
+
+통신별 경로와 전환 범위는 [시스템 아키텍처](docs/system-architecture.md)를 참고한다.
+
 ## 포함 서비스
 
 - `ota_gh_postgres`: OTA 메타데이터 저장 DB
@@ -80,7 +117,7 @@ curl -sS http://localhost:4000/health
 docker compose -f docker-compose.ota-stack.yml ps
 ```
 
-## 주요 API
+## 주요 API (현재 구현)
 
 - `GET /health`
 - `GET /api/v1/vehicles`
@@ -93,7 +130,7 @@ docker compose -f docker-compose.ota-stack.yml ps
 - `GET /firmware/<filename>`
 - `GET /stats/summary`
 
-## 주요 환경 변수
+## 주요 환경 변수 (현재 구현)
 
 - `OTA_GH_FIRMWARE_BASE_URL`: 디바이스가 접근 가능한 펌웨어 base URL
 - `OTA_GH_SERVER_PORT`, `OTA_GH_DASHBOARD_PORT`: API와 dashboard 포트
@@ -104,7 +141,7 @@ docker compose -f docker-compose.ota-stack.yml ps
 - `OTA_GH_LOCAL_PROBE_ENABLED`: local probe fallback 사용 여부
 - `OTA_GH_LOCAL_DEVICE_MAP`: local probe 또는 HTTP fallback용 장치 매핑
 - `OTA_GH_MQTT_COMMAND_ONLY`: MQTT-only trigger 정책
-- `OTA_GH_LLM_VERIFY`, `OTA_GH_LLM_MODEL`: OTA verify LLM 설정
+- `OTA_GH_LLM_VERIFY`, `OTA_GH_LLM_MODEL`: 현재 서버의 외부 LLM 검증 설정. Jetson 목표 구조 전환 전까지 적용되며, 이 값을 끄는 것만으로 Jetson 검증이 연결되지는 않음
 - `OTA_GH_MONITORING_INGEST_URL`: monitoring ingest 연동 주소
 
 `ota-stack-up.sh`는 `OTA_GH_FIRMWARE_BASE_URL`이 비어 있으면 호스트 IP를 계산해 `.env`에 기록합니다.
