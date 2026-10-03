@@ -68,10 +68,6 @@
 - 기존 서버의 `record_only` 기능을 기록 경로로 활용하되, Jetson 결과·모델 버전의 보존과 표시를 위한 연동은 후속 구현이다. `record_only`는 검증 승인 API가 아니다.
 - 모델의 입력·출력 형식, 조건부 승인 처리, Ethernet API의 인증·TLS·재전송 방지 정책은 후속 설계 대상이다. 물리적 직결만으로 신뢰할 수 있는 검증 결과가 되는 것은 아니다.
 
-## 2단계 Gateway 계층 아키텍처
-
-Gateway 내부의 Application·Middleware·Kernel·Firmware·Hardware 계층과 Normal World / Secure World 경계는 [OTA_Telechips의 2단계 아키텍처](https://github.com/SEAME-MCS-OTA/OTA_Telechips/blob/main/README.md#2단계-gateway-계층-아키텍처)를 참고한다. 서버와 Jetson은 이 상세도에서 외부 시스템으로 표시한다.
-
 ## 포함 서비스
 
 - `ota_gh_postgres`: OTA 메타데이터 저장 DB
