@@ -10,6 +10,8 @@
 
 현재 서버 코드에는 외부 Claude API를 호출하는 `/api/ota/verify` gate가 남아 있다. Jetson 연동과 무응답 시 설치 보류·재시도는 목표 설계이며 이번 변경으로 구현되지는 않는다. 아래 실행·API 설명은 현재 구현 기준이다.
 
+Gateway 내부 계층과 보안 경계는 [2단계 Gateway 아키텍처](https://github.com/SEAME-MCS-OTA/OTA_Telechips/blob/main/README.md#2단계-gateway-계층-아키텍처)를 참고한다.
+
 ## 구성
 
 - `server/`: Flask 기반 OTA API 서버
