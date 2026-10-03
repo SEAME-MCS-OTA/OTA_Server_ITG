@@ -70,6 +70,8 @@ docker compose -f docker-compose.ota-stack.yml down
 - MQTT TCP: `localhost:1883`
 - MQTT WS: `localhost:9001`
 
+대시보드는 현재 브라우저 접속 주소의 `/api/`, `/health`, `/monitoring/`으로 데이터를 요청합니다. 대시보드 Nginx가 각 백엔드로 전달하므로 서버 IP가 바뀌어도 프런트엔드를 다시 빌드할 필요가 없습니다. 외부 HTTPS 프록시를 사용하는 경우에도 동일 경로를 전달해야 합니다. 기존 `VITE_APP_API_URL` 및 `VITE_VLM_API_URL` 빌드 변수는 사용하지 않습니다.
+
 ## 기본 점검
 
 ```bash

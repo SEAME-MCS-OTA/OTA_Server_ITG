@@ -20,13 +20,9 @@ import {
 } from 'lucide-react';
 import { MapContainer, TileLayer, CircleMarker, Tooltip as LeafletTooltip } from 'react-leaflet';
 
-const API_BASE_URL =
-  import.meta.env.VITE_APP_API_URL ||
-  `${window.location.protocol}//${window.location.hostname}:8080`;
-
-const MONITORING_API_BASE_URL =
-  import.meta.env.VITE_VLM_API_URL ||
-  `${window.location.protocol}//${window.location.hostname}:4000`;
+// Route API requests through the dashboard origin so IP changes need no rebuild.
+const API_BASE_URL = window.location.origin;
+const MONITORING_API_BASE_URL = `${window.location.origin}/monitoring`;
 
 const REFRESH_INTERVAL = 5000;
 const ONLINE_WINDOW_SEC = 60;
