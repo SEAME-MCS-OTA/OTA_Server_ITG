@@ -11,6 +11,7 @@ import time
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
+from claude_verification import require_enabled
 
 try:
     import anthropic
@@ -73,6 +74,16 @@ def _llm_temperature() -> float:
     except (TypeError, ValueError):
         logger.warning("Invalid LLM_TEMPERATURE=%r; falling back to 0", raw)
         return 0.0
+
+
+def _llm_max_tokens() -> int:
+    raw = os.getenv("LLM_MAX_TOKENS", "4096")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid LLM_MAX_TOKENS=%r; falling back to 4096", raw)
+        return 4096
+    return max(1024, min(value, 8192))
 
 
 def _extract_vehicle_versions(ota_log: dict) -> tuple[str, str, str]:
@@ -1511,6 +1522,7 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
 
     Returns a normalized verification result dictionary.
     """
+    require_enabled()
     try:
         vehicle_id, current_version, new_version = _extract_vehicle_versions(ota_log_json)
         started_at = time.monotonic()
@@ -1552,15 +1564,16 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
                 call_count += 1
                 response = client.messages.create(
                     model=model,
-                    max_tokens=1600,
+                    max_tokens=_llm_max_tokens(),
                     temperature=_llm_temperature(),
                     system=_system_prompt(),
                     messages=[
                         {
                             "role": "user",
                             "content": (
-                                "Analyze the following OTA update log JSON and return only one JSON object "
-                                "that conforms to the required output schema.\n\n"
+                                "Analyze the following OTA update log JSON and return only one compact JSON object "
+                                "that conforms to the required output schema. Do not use markdown, code fences, "
+                                "or explanatory text outside the JSON object. Keep string fields concise.\n\n"
                                 f"{json.dumps(ota_log_json, indent=2, ensure_ascii=False)}"
                             )
                         }
@@ -1584,6 +1597,12 @@ def call_llm_verification(ota_log_json: dict, model: str = "claude-sonnet-4-2025
 
         result_text = response.content[0].text
         parsed_payload = _extract_json_object(result_text)
+        if parsed_payload is None:
+            logger.warning(
+                "LLM response JSON parse failed stop_reason=%s text_prefix=%r",
+                getattr(response, "stop_reason", None),
+                result_text[:120],
+            )
         normalized = _normalize_llm_json_result(
             parsed_payload or {},
             result_text,

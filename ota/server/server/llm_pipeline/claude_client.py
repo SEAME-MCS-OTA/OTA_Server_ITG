@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 import requests
+from claude_verification import require_enabled
 
 SECURITY_ANALYSIS_PROMPT_KO = """너는 차량 OTA 업데이트 보안 분석 에이전트이다.
 
@@ -97,6 +98,7 @@ class ClaudeClient:
         }
 
     def analyze_log(self, *, log_json: str) -> Dict[str, Any]:
+        require_enabled()
         user_prompt = (
             f"{SECURITY_ANALYSIS_PROMPT_KO}\n\n"
             "[OTA 업데이트 로그(JSON)]\n"

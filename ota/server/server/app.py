@@ -3,6 +3,7 @@ OTA Server - Main Application
 Flask REST API 서버
 """
 import json
+import re
 import os
 import logging
 import hashlib
@@ -28,9 +29,9 @@ from config import Config
 from models import db, Vehicle, Firmware, UpdateHistory
 from mqtt_handler import MQTTHandler
 from monitoring_reporter import publish_update_result, should_report_final_status
+import claude_verification
+import verification_policy
 from llm_verifier import (
-    apply_longitudinal_escalation,
-    call_llm_verification,
     get_llm_log_path,
     preprocess_log,
     save_verification_result,
@@ -372,12 +373,26 @@ def build_firmware_url(filename: str) -> str:
     return f"{request.url_root.rstrip('/')}/firmware/{filename}"
 
 
+@app.route('/api/ota/verification-time', methods=['GET'])
+def verification_time():
+    """Use only through the authenticated HTTPS listener; nonce defeats caching."""
+    nonce = request.args.get('nonce', '')
+    if len(nonce) != 32 or any(c not in '0123456789abcdef' for c in nonce):
+        return jsonify({'error': 'invalid nonce'}), 400
+    result = jsonify({'nonce': nonce, 'unix_seconds': int(time.time())})
+    result.headers['Cache-Control'] = 'no-store'
+    return result
+
+
 def _command_payload_bytes(
     ota_id: str,
     url: str,
     target_version: str,
     expected_sha256: str,
     expected_size: int,
+    device_id: str = "",
+    issued_at=None,
+    expires_at=None,
 ) -> bytes:
     body = {
         "ota_id": str(ota_id or "").strip(),
@@ -385,6 +400,10 @@ def _command_payload_bytes(
         "target_version": str(target_version or "").strip(),
         "expected_sha256": str(expected_sha256 or "").strip().lower(),
         "expected_size": int(expected_size or 0),
+        "command_schema_version": "ota-command-v2",
+        "device_id": device_id,
+        "issued_at": issued_at,
+        "expires_at": expires_at,
     }
     return json.dumps(
         body,
@@ -400,6 +419,9 @@ def _sign_command_payload(
     target_version: str,
     expected_sha256: str,
     expected_size: int,
+    device_id: str = "",
+    issued_at=None,
+    expires_at=None,
 ) -> tuple[dict | None, str | None]:
     if not Config.COMMAND_SIGNING_ENABLED:
         return None, None
@@ -418,6 +440,9 @@ def _sign_command_payload(
         target_version=target_version,
         expected_sha256=expected_sha256,
         expected_size=expected_size,
+        device_id=device_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
     )
 
     msg_fd = -1
@@ -591,7 +616,11 @@ def _build_signed_firmware_info(vehicle_id: str, firmware: Firmware, ota_id: str
             "Set OTA_GH_FIRMWARE_BASE_URL=http://<HOST_IP>:8080 and restart ota_gh_server."
         )
 
+    issued_at = int(time.time())
     firmware_info = {
+        'device_id': vehicle_id,
+        'issued_at': issued_at,
+        'expires_at': issued_at + 3600,
         'version': firmware.version,
         'url': firmware_url,
         'sha256': firmware.sha256,
@@ -604,6 +633,9 @@ def _build_signed_firmware_info(vehicle_id: str, firmware: Firmware, ota_id: str
         target_version=firmware.version,
         expected_sha256=firmware.sha256,
         expected_size=int(firmware.file_size or 0),
+        device_id=vehicle_id,
+        issued_at=firmware_info['issued_at'],
+        expires_at=firmware_info['expires_at'],
     )
     if signature_obj:
         firmware_info['signature'] = signature_obj
@@ -712,6 +744,7 @@ def _announce_update_to_vehicle(vehicle: Vehicle | None, vehicle_id: str, firmwa
         "vehicle_id": vehicle_id,
         "version": firmware.version,
         "target_version": firmware.version,
+        "release_notes": firmware.release_notes or "",
         "timestamp": datetime.utcnow().isoformat(),
     }
 
@@ -755,6 +788,7 @@ def _trigger_device_http(vehicle_id: str, ota_id: str, firmware_info: dict):
         "sha256": firmware_info.get("sha256", ""),
         "size": firmware_info.get("size", 0),
         "signature": firmware_info.get("signature"),
+        **{k: firmware_info.get(k) for k in ("device_id", "issued_at", "expires_at")},
     }
     try:
         resp = requests.post(
@@ -1622,30 +1656,46 @@ def trigger_update():
 
 
 # ── LLM 런타임 토글 상태 ──────────────────────
-_llm_enabled = Config.LLM_VERIFICATION_ENABLED
+# Legacy LLM_VERIFY no longer selects a mode; persisted verification_policy does.
 
 
 @app.route('/api/v1/llm/config', methods=['GET'])
 def get_llm_config():
     """LLM 검증 설정 조회."""
-    return jsonify({
-        'enabled': _llm_enabled,
-        'model': Config.LLM_MODEL,
-    })
+    return jsonify({**verification_policy.snapshot(), 'model': Config.LLM_MODEL})
 
 
 @app.route('/api/v1/llm/config', methods=['POST'])
 def set_llm_config():
     """LLM 검증 ON/OFF 런타임 토글."""
-    global _llm_enabled
     data = request.get_json() or {}
-    if 'enabled' in data:
-        _llm_enabled = bool(data['enabled'])
-        logger.info(f"LLM verification toggled: {'ON' if _llm_enabled else 'OFF'}")
-    return jsonify({
-        'enabled': _llm_enabled,
-        'model': Config.LLM_MODEL,
-    })
+    if type(data.get('enabled')) is not bool:
+        return jsonify({'error': 'enabled must be boolean'}), 400
+    try:
+        value = verification_policy.set_mode('CLAUDE' if data['enabled'] else 'ON_DEVICE')
+        logger.info('VERIFICATION_POLICY %s', value)
+        return jsonify({**value, 'model': Config.LLM_MODEL})
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+
+@app.route('/api/v1/verification/config', methods=['GET', 'POST'])
+def verification_config():
+    if request.method == 'POST':
+        try:
+            value = verification_policy.set_mode((request.get_json() or {}).get('mode'))
+        except (ValueError, TypeError) as exc:
+            return jsonify({'error': str(exc)}), 400
+        logger.info('VERIFICATION_POLICY %s', value)
+    else:
+        value = verification_policy.snapshot()
+    nonce = request.args.get('nonce', '')
+    if nonce and not re.fullmatch('[0-9a-f]{32}', nonce):
+        return jsonify({'error': 'Invalid nonce'}), 400
+    response = jsonify({**value, 'nonce': nonce, 'model': Config.LLM_MODEL,
+                        'ondevice_model': 'ota-qwen3-t3-q4km-v1'})
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 def _normalize_ota_verify_payload(ota_log: dict) -> dict:
@@ -1790,6 +1840,13 @@ def verify_ota_update():
             return jsonify({"error": "No JSON body provided"}), 400
         verify_mode = str(request.headers.get("X-OTA-Verify-Mode") or "gate").strip().lower()
 
+        if verify_mode != "record_only" and verification_policy.snapshot()['mode'] != 'CLAUDE':
+            return jsonify({
+                "error": "CLAUDE_VERIFICATION_DISABLED",
+                "decision": "HOLD",
+                "reason": "Legacy cloud verification is disabled; use the Gateway on-device gate.",
+            }), 503
+
         if ota_log_raw.get("schema_version") in ("ota-verify-v2", "ota-verify-v3"):  # v3 added 2026-05-08
             required_fields = ["rule_check_results", "context_data"]
             for field in required_fields:
@@ -1860,14 +1917,13 @@ def verify_ota_update():
                 "recommendations": ["Inspect the failing deterministic rule results."],
                 "raw_response": None,
             }
-        elif _llm_enabled:
-            result = call_llm_verification(preprocessed, model=Config.LLM_MODEL)
-            result = apply_longitudinal_escalation(preprocessed, result)
+        elif verification_policy.snapshot()['mode'] == 'CLAUDE':
+            result = claude_verification.verify(preprocessed, model=Config.LLM_MODEL)
         else:
             result = {
-                "decision": "APPROVE",
-                "reason": "LLM verification disabled. Deterministic checks passed.",
-                "summary": "LLM verification disabled. Deterministic checks passed.",
+                "decision": "HOLD",
+                "reason": "Claude verification is disabled by the active policy.",
+                "summary": "Claude verification is disabled by the active policy.",
                 "warnings": [],
                 "analysis": {},
                 "causal_analysis": {
@@ -1899,7 +1955,7 @@ def verify_ota_update():
             "OTA verify: vehicle=%s decision=%s llm_enabled=%s verify_mode=%s all_rules_passed=%s",
             verify_vehicle_id,
             result["decision"],
-            _llm_enabled,
+            verification_policy.snapshot()['enabled'],
             verify_mode,
             all_rules_passed,
         )
@@ -1926,6 +1982,7 @@ def verify_ota_update():
             "recommendations": result.get("recommendations", result.get("recommended_actions", [])),
             "llm_metrics": result.get("llm_metrics", {}) if isinstance(result.get("llm_metrics"), dict) else {},
             "timestamp": datetime.utcnow().isoformat() + "Z",
+            "binding": ota_log_raw.get('_verification_binding'),
         })
 
     except Exception as e:
@@ -2043,7 +2100,7 @@ def list_llm_results():
         deduped.sort(key=lambda r: r.get('id') or 0, reverse=True)
         if limit:
             deduped = deduped[:limit]
-        return jsonify({'results': deduped, 'total': len(deduped), 'llm_enabled': _llm_enabled})
+        return jsonify({'results': deduped, 'total': len(deduped), 'llm_enabled': verification_policy.snapshot()['enabled']})
     except Exception as e:
         logger.error(f"Error listing LLM results: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from config import Config
+import claude_verification
 
 from .claude_client import ClaudeClient, ClaudeClientError
 from .preprocessor import preprocess_log_payload
@@ -39,13 +40,13 @@ def analyze_monitoring_payload(
     )
     preprocessed = preprocess_log_payload(payload, max_chars=max_chars)         # 전처리한 데이터(문자열 길이 제한, 민감 정보 마스킹 등)
 
-    if llm_enabled_override is None:
-        llm_enabled = bool(Config.LLM_VERIFICATION_ENABLED) or bool(force_llm)
-    else:
-        llm_enabled = bool(llm_enabled_override) or bool(force_llm)
+    from verification_policy import snapshot
+    llm_enabled = snapshot()['mode'] == 'CLAUDE'
     has_api_key = bool(getattr(Config, "ANTHROPIC_API_KEY", "").strip())
 
-    if llm_enabled and has_api_key:
+    if not claude_verification.ENABLED or snapshot()['mode'] != 'CLAUDE':
+        decision = _fail_safe_decision("Legacy Claude verification is disabled in code.")
+    elif llm_enabled and has_api_key:
         try:
             client = ClaudeClient(
                 api_key=Config.ANTHROPIC_API_KEY,

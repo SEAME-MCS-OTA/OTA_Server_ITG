@@ -11,62 +11,29 @@
 - Monitoring backend
 - Monitoring MySQL
 
-## 1단계 목표 시스템 아키텍처
-
-기존 OTA 배포·설치 흐름을 유지하고, 서버의 Claude API 기반 2차 검증을 Ethernet으로 연결한 Jetson Orin Nano의 로컬 모델로 이전한다. 모델은 LLM으로 한정하지 않는다. Gateway가 설치 여부를 판단·실행하고, 서버는 배포와 이력 저장을 담당한다.
-
-**설계 상태:** 아래는 합의된 목표 구조다. 현재 코드는 서버 `/api/ota/verify`를 통한 외부 LLM 검증을 사용한다. Jetson 호출, 결과 전달, 장애 시 보류·재시도는 아직 구현되지 않았다. 이 문서 변경은 실행 코드나 배포 설정을 바꾸지 않는다.
+## 현재 시스템 역할 (2026-11-11 소스)
 
 ```text
-+--------------------------------------------------------------------+
-| OTA Server - Raspberry Pi                                          |
-| Dashboard | OTA API | Firmware Storage | MQTT Broker | Databases   |
-+--------------------------------------------------------------------+
-       | [1] MQTT             ^ [2] MQTT          ^ [3][4] HTTPS
-       | Notice / Command     | Register /       | GET firmware
-       |                      | Request /        | POST logs, events,
-       |                      | Status / Progress| verification records
-       v                      |                  |
-+--------------------------------------------------------------------+
-| Gateway - Telechips D3-G                                           |
-| OTA Client | Primary Verification | Installation Decision          |
-| RAUC A/B Update | Boot Confirmation | OP-TEE Anti-rollback         |
-+--------------------------------------------------------------------+
-       | [5] Verification request                ^ [6] Result
-       | Metadata / Logs / Device status         | Decision / Reason /
-       |                                         | Model version
-       |          Ethernet - Verification API    |
-       |          (application protocol: TBD)    |
-       v                                         |
-+--------------------------------------------------------------------+
-| Secondary Verifier - Jetson Orin Nano                              |
-| Verification API | On-device Model                                 |
-+--------------------------------------------------------------------+
+OTA Server ── MQTT 공지·서명 명령 / HTTPS 펌웨어·시각 ──> D3-G Gateway
+OTA Server <── 등록·요청·상태·진행률 / 이벤트·audit ──── D3-G Gateway
+                                                          │
+                                      전용 Ethernet HTTPS │
+                                                          ▼
+                                             Jetson Qwen3-8B QLoRA
+                                           APPROVE / REJECT / 실행 오류
 ```
 
-화살표 [3]은 HTTPS GET **요청 방향**이다. 펌웨어 본문은 서버 → Gateway의 응답으로 전달된다. MQTT와 HTTPS는 대체 관계가 아니라 메시지 종류에 따라 역할을 나눈다. [5][6]은 요청·응답의 논리적 방향이며 Ethernet 자체가 API 프로토콜을 뜻하지 않는다.
+Gateway 소스는 외부 Claude gate 호출을 중단하고 Jetson `https://10.77.0.1:8443/api/v1/ota/verify`를 사용한다. 모델은 판정만 반환하고 설치 결정·RAUC·재부팅·TEE commit은 D3-G가 담당한다. Qt UI와 UART TUI는 같은 Gateway API에 요청한다. Jetson은 서버에 직접 보고하지 않는다.
 
-### 통신별 역할
+서버의 `/api/ota/verify`와 Claude 관련 코드는 기존 도구/benchmark용으로 남아 있다. 현재 Gateway는 해당 endpoint를 record_only 저장에 사용하며, 서버 LLM toggle을 바꿔도 Gateway의 Jetson gate를 우회하지 않는다. 전체 Jetson 원본 응답의 DB/대시보드 연동 완료를 주장하지 않는다.
 
-| 번호 | 방향 | 프로토콜 | 내용 / 기존 구현 경로 |
-| --- | --- | --- | --- |
-| 1 | 서버 → Gateway | MQTT | `ota/releases/announce` 업데이트 알림, `ota/{vehicle_id}/cmd` 설치 명령 |
-| 2 | Gateway → 서버 | MQTT | `ota/vehicles/register` 장치 등록·업데이트 요청, `ota/{vehicle_id}/status` 상태, `ota/{vehicle_id}/progress` 진행률 |
-| 3 | Gateway → 서버 요청 / 서버 → Gateway 응답 | HTTPS GET | 배포 URL의 `.raucb` 다운로드. 실제 저장소 또는 리다이렉트 구성은 배포 설정에 따름 |
-| 4 | Gateway → 서버 | HTTPS POST | `/ingest` 이벤트, `/api/v1/client-logs` 상세 로그, `/api/ota/verify`의 `record_only` 검증 기록. 각 보고 기능은 설정에 따라 활성화됨 |
-| 5 | Gateway → Jetson | Ethernet 위 검증 API, 프로토콜 미정 | 업데이트 메타데이터, 1차 검증 결과·로그, 장치 상태 |
-| 6 | Jetson → Gateway | 같은 API의 응답 | 검증 판단·근거·모델 버전. 상세 응답 스키마는 후속 설계 |
+### 명령 Freshness v2 및 전환 조건
 
-서버 링크의 HTTPS는 목표 배포 기준이다. 현재 클라이언트의 URL과 TLS 설정은 실행 구성에 따르며, 문서 수정만으로 모든 HTTP 호출이 HTTPS로 전환되지는 않는다.
+새 서버 소스는 대상 장치와 issued_at/expires_at을 포함한 Ed25519 `ota-command-v2` 서명을 발급하고 `/api/ota/verification-time`을 제공한다. 새 Gateway가 이 규격과 인증된 서버 시각을 확인한다. [상세 계약](ota/server/README.md#서명-명령-v2와-freshness).
 
-### 판단과 장애 처리
+**2026-11-15 실서버 반영 완료:** 라즈베리 파이에 v2 서명과 시간 API를 배포했고, 현재 D3-G에도 v2 검증 코드가 있음을 확인했다. 기존 CA를 이용한 D3-G → 서버 HTTPS 시간 조회(200, nonce 일치, no-store)와 실제 서버 키로 서명한 명령의 Gateway 검증이 통과했다. 잘못된 nonce는 400으로 거절했다. 실제 OTA 설치는 요청하지 않았다. v1 Gateway와 v2 서명 서버는 호환되지 않으므로 다른 보드에는 운영 버전을 먼저 확인한다. [상세 계약·배포 기록](ota/server/README.md#서명-명령-v2와-freshness), [Gateway 진행 기록](../OTA_Telechips/docs/project-status.md).
 
-- Gateway는 기존 서명·무결성·버전 정책과 deterministic rule 검사를 유지한다. 1차 검증 실패를 모델의 승인으로 덮어쓰지 않는다.
-- Jetson은 2차 검증 결과를 반환한다. RAUC 설치를 실행하거나 부팅 슬롯을 변경하는 주체는 Gateway다.
-- 명시적 거부와 통신 장애를 구분한다. Jetson 무응답·연결 실패 시 설치를 **보류하고 재시도**하며, 모델 검증을 생략하고 설치하지 않는다. 재시도 간격·상한·운영자 개입 조건은 미정이다.
-- Gateway가 Jetson 결과와 실제 처리 결과를 서버에 HTTPS로 기록한다. Jetson → 서버 직접 보고 경로는 현재 목표에 포함하지 않는다.
-- 기존 서버의 `record_only` 기능을 기록 경로로 활용하되, Jetson 결과·모델 버전의 보존과 표시를 위한 연동은 후속 구현이다. `record_only`는 검증 승인 API가 아니다.
-- 모델의 입력·출력 형식, 조건부 승인 처리, Ethernet API의 인증·TLS·재전송 방지 정책은 후속 설계 대상이다. 물리적 직결만으로 신뢰할 수 있는 검증 결과가 되는 것은 아니다.
+2026-11-11 초기 TUI 시도의 모델 REJECT 기록과 이후 배포·실행 상태는 구분한다. 이번 서버 프로토콜 검증은 펌웨어 다운로드·설치·재부팅·TEE commit 전체 사이클의 시험을 대신하지 않는다.
 
 ## 포함 서비스
 
@@ -140,6 +107,7 @@ docker compose -f docker-compose.ota-stack.yml ps
 ## 주요 API (현재 구현)
 
 - `GET /health`
+- `GET /api/ota/verification-time?nonce=<32자리 hex>` (새 Gateway용 인증된 HTTPS 시각 조회)
 - `GET /api/v1/vehicles`
 - `GET /api/v1/firmware`
 - `POST /api/v1/admin/firmware`
@@ -161,7 +129,7 @@ docker compose -f docker-compose.ota-stack.yml ps
 - `OTA_GH_LOCAL_PROBE_ENABLED`: local probe fallback 사용 여부
 - `OTA_GH_LOCAL_DEVICE_MAP`: local probe 또는 HTTP fallback용 장치 매핑
 - `OTA_GH_MQTT_COMMAND_ONLY`: MQTT-only trigger 정책
-- `OTA_GH_LLM_VERIFY`, `OTA_GH_LLM_MODEL`: 현재 서버의 외부 LLM 검증 설정. Jetson 목표 구조 전환 전까지 적용되며, 이 값을 끄는 것만으로 Jetson 검증이 연결되지는 않음
+- `OTA_GH_LLM_VERIFY`, `OTA_GH_LLM_MODEL`: 서버에 남아 있는 외부 LLM 검증/기존 평가용 설정. 새 Gateway의 Jetson gate를 활성화·비활성화하지 않음
 - `OTA_GH_MONITORING_INGEST_URL`: monitoring ingest 연동 주소
 
 `ota-stack-up.sh`는 `OTA_GH_FIRMWARE_BASE_URL`이 비어 있으면 호스트 IP를 계산해 `.env`에 기록합니다.
