@@ -31,7 +31,7 @@ Gateway 소스는 외부 Claude gate 호출을 중단하고 Jetson `https://10.7
 
 새 서버 소스는 대상 장치와 issued_at/expires_at을 포함한 Ed25519 `ota-command-v2` 서명을 발급하고 `/api/ota/verification-time`을 제공한다. 새 Gateway가 이 규격과 인증된 서버 시각을 확인한다. [상세 계약](ota/server/README.md#서명-명령-v2와-freshness).
 
-**2026-11-15 실서버 반영 완료:** 라즈베리 파이에 v2 서명과 시간 API를 배포했고, 현재 D3-G에도 v2 검증 코드가 있음을 확인했다. 기존 CA를 이용한 D3-G → 서버 HTTPS 시간 조회(200, nonce 일치, no-store)와 실제 서버 키로 서명한 명령의 Gateway 검증이 통과했다. 잘못된 nonce는 400으로 거절했다. 실제 OTA 설치는 요청하지 않았다. v1 Gateway와 v2 서명 서버는 호환되지 않으므로 다른 보드에는 운영 버전을 먼저 확인한다. [상세 계약·배포 기록](ota/server/README.md#서명-명령-v2와-freshness), [Gateway 진행 기록](../OTA_Telechips/docs/project-status.md).
+**2026-11-15 실서버 반영 완료:** 라즈베리 파이에 v2 서명과 시간 API를 배포했고, 현재 D3-G에도 v2 검증 코드가 있음을 확인했다. 기존 CA를 이용한 D3-G → 서버 HTTPS 시간 조회(200, nonce 일치, no-store)와 실제 서버 키로 서명한 명령의 Gateway 검증이 통과했다. 잘못된 nonce는 400으로 거절했다. 실제 OTA 설치는 요청하지 않았다. v1 Gateway와 v2 서명 서버는 호환되지 않으므로 다른 보드에는 운영 버전을 먼저 확인한다. [상세 계약·배포 기록](ota/server/README.md#서명-명령-v2와-freshness), [Gateway 보안 설계](https://github.com/SEAME-MCS-OTA/OTA_Telechips/blob/main/docs/security-design.md).
 
 2026-11-11 초기 TUI 시도의 모델 REJECT 기록과 이후 배포·실행 상태는 구분한다. 이번 서버 프로토콜 검증은 펌웨어 다운로드·설치·재부팅·TEE commit 전체 사이클의 시험을 대신하지 않는다.
 
