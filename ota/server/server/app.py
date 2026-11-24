@@ -1864,8 +1864,8 @@ def verify_ota_update():
 
         if verify_mode == "record_only":
             record_decision = str(request.headers.get("X-OTA-Verify-Decision") or "APPROVE").strip().upper()
-            if record_decision not in {"APPROVE", "REJECT", "CONDITIONAL_APPROVE"}:
-                record_decision = "APPROVE"
+            if record_decision not in {"APPROVE", "REJECT", "HOLD", "CONDITIONAL_APPROVE"}:
+                return jsonify({"error": "Invalid recorded decision"}), 400
             record_reason = str(request.headers.get("X-OTA-Verify-Reason") or "").strip()
             result = {
                 "decision": record_decision,

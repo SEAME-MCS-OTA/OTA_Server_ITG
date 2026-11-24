@@ -82,6 +82,30 @@ def test_cloud_enabled_calls_module_and_echoes_binding(api, monkeypatch):
     call.assert_called_once()
 
 
+@pytest.mark.parametrize('decision', ['APPROVE', 'REJECT', 'HOLD'])
+def test_record_only_preserves_gateway_decisions_without_paid_inference(api, monkeypatch, decision):
+    client, scope = api
+    call = Mock(side_effect=AssertionError('must not invoke paid API'))
+    monkeypatch.setattr(claude_verification, 'verify', call)
+    payload = {'schema_version': 'ota-verify-v3', 'rule_check_results': {}, 'context_data': {},
+               '_verification_context': {'mode': 'ON_DEVICE', 'gateway_decision': decision}}
+    r = client.post('/api/ota/verify', json=payload, headers={
+        'X-OTA-Verify-Mode': 'record_only', 'X-OTA-Verify-Decision': decision})
+    assert r.status_code == 200 and r.json['decision'] == decision
+    saved_payload, result = scope['save_verification_result'].call_args.args
+    assert saved_payload == payload and result['decision'] == decision
+    call.assert_not_called()
+
+
+def test_unknown_recorded_decision_is_not_stored_as_approval(api):
+    client, scope = api
+    r = client.post('/api/ota/verify', json={'schema_version': 'ota-verify-v3',
+        'rule_check_results': {}, 'context_data': {}}, headers={
+        'X-OTA-Verify-Mode': 'record_only', 'X-OTA-Verify-Decision': 'MAYBE'})
+    assert r.status_code == 400
+    scope['save_verification_result'].assert_not_called()
+
+
 def test_code_switch_blocks_runtime_enable(api, monkeypatch):
     client, _=api
     monkeypatch.setattr(claude_verification,'ENABLED',False)
